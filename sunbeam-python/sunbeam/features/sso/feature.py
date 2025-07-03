@@ -1,13 +1,13 @@
 import click
 import pydantic
+import yaml
 
-from sunbeam.clusterd.client import Client
 from rich.console import Console
 from sunbeam.core.manifest import CharmManifest, FeatureConfig, SoftwareConfig
 from sunbeam.features.interface.v1.base import (
-    BaseFeatureGroup,
     FeatureRequirement,
 )
+from rich.table import Table
 from sunbeam.core.deployment import Deployment
 from packaging.version import Version
 from sunbeam.core.terraform import TerraformException, TerraformInitStep
@@ -16,24 +16,26 @@ from sunbeam.clusterd.service import ConfigItemNotFoundException
 from sunbeam.core.openstack import OPENSTACK_MODEL
 from sunbeam.features.interface.v1.openstack import (
     OpenStackControlPlaneFeature,
-    WaitForApplicationsStep,
     TerraformPlanLocation,
 )
 from sunbeam.core.common import (
-    BaseStep,
-    Result,
-    ResultType,
+    FORMAT_TABLE,
+    FORMAT_YAML,
     read_config,
     run_plan,
     update_config,
+    str_presenter,
 )
 from sunbeam.core.juju import (
     ActionFailedException,
     JujuHelper,
     LeaderNotFoundException,
-    run_sync,
 )
-from .providers import AddExternalProviderStep
+from .providers import (
+    AddExternalProviderStep,
+    RemoveExternalProviderStep,
+    UpdateExternalProviderStep,
+)
 
 console = Console()
 
@@ -46,7 +48,7 @@ class SSOFeature(OpenStackControlPlaneFeature):
     }
     SSO_CONFIG_KEY = "SSOFeatureConfigKey"
     
-    def provider_config(self, deployment: Deployment, cfg: str) -> dict:
+    def provider_config(self, deployment: Deployment, cfg: str = "") -> dict:
         """Return stored provider configuration."""
         try:
             cfg = cfg or self.get_tfvar_config_key()
@@ -89,7 +91,10 @@ class SSOFeature(OpenStackControlPlaneFeature):
     
     def set_tfvars_on_disable(self, deployment: Deployment) -> dict:
         """Set terraform variables to disable the application."""
-        tfvars: dict[str, None | bool] = {"keystone-to-trusted-dashboard": False}
+        tfvars: dict[str, None | bool | dict] = {
+            "keystone-to-trusted-dashboard": False,
+            "sso-providers": {},
+        }
         return tfvars
     
     def set_tfvars_on_resize(
@@ -123,23 +128,52 @@ class SSOFeature(OpenStackControlPlaneFeature):
     ) -> None:
         """Disable SSO."""
         config = self.provider_config(deployment)
-        print(config)
         providers = config.get("sso-providers", {})
         if not no_prompt and providers:
             msg = ("You have multiple SSO providers enabled. "
             "This will disable all of them. Are you sure?")
             click.confirm(msg, abort=True)
         self.disable_feature(deployment, show_hints)
+        update_config(deployment.get_client(), self.SSO_CONFIG_KEY, {})
     
     @click.command()
+    @click.option(
+        "--format",
+        type=click.Choice([FORMAT_TABLE, FORMAT_YAML]),
+        default=FORMAT_TABLE,
+        help="Output format",
+    )
     @pass_method_obj
-    def list_providers(self, deployment: Deployment) -> None:
+    def list_providers(self, deployment: Deployment, format: str) -> None:
         """List SSO providers."""
         try:
-            tfvars = self.provider_config(deployment)
+            cfg = self.provider_config(deployment, self.SSO_CONFIG_KEY)
         except ConfigItemNotFoundException:
-            tfvars = {}
-        click.echo(" ".join(tfvars.get("sso-providers", {}).keys()))
+            cfg = {}
+
+        results = {}
+        for k, v in cfg.items():
+            results[k] = {
+                "type": v.get("provider_type", "unknown"),
+                "protocol": v.get("provider_proto", "unknown"),
+                "issuer_url": v.get("config", {}).get("issuer_url", "unknown"),
+            }
+        
+        if format == FORMAT_TABLE:
+            table = Table()
+            table.add_column("Provider Name")
+            table.add_column("Type")
+            table.add_column("Protocol")
+            for provider, data in results.items():
+                table.add_row(
+                    provider,
+                    data["type"],
+                    data["protocol"],
+                )
+            console.print(table)
+        elif format == FORMAT_YAML:
+            yaml.add_representer(str, str_presenter)
+            console.print(yaml.dump(results))
 
     @click.command()
     @click.argument(
@@ -175,7 +209,16 @@ class SSOFeature(OpenStackControlPlaneFeature):
         show_hints: bool,
     ) -> None:
         """Add a new SSO Provider."""
-        jhelper = JujuHelper(deployment.get_connected_controller())
+        try:
+            cfg = self.provider_config(deployment, self.SSO_CONFIG_KEY)
+        except ConfigItemNotFoundException:
+            cfg = {}
+
+        if name in cfg:
+            click.echo(f"{name} is already enabled.")
+            return
+        
+        jhelper = JujuHelper(deployment.juju_controller)
         if provider_type != "canonical":
             step = AddExternalProviderStep(
                 deployment=deployment,
@@ -198,10 +241,81 @@ class SSOFeature(OpenStackControlPlaneFeature):
         click.echo(f"{name} added.")
 
     @click.command()
+    @click.argument("name", type=str)
+    @click_option_show_hints
+    @pass_method_obj
+    def remove_provider(self, deployment: Deployment, name: str, show_hints: bool):
+        """Remove a SSO provider."""
+        try:
+            cfg = self.provider_config(deployment, self.SSO_CONFIG_KEY)
+        except ConfigItemNotFoundException:
+            cfg = {}
+
+        if name not in cfg:
+            click.echo(f"{name} does not exist.")
+            return
+
+        jhelper = JujuHelper(deployment.juju_controller)
+        plan = [
+            TerraformInitStep(deployment.get_tfhelper(self.tfplan)),
+            RemoveExternalProviderStep(
+                deployment=deployment,
+                config=FeatureConfig(),
+                jhelper=jhelper,
+                feature=self,
+                provider_name=name,
+            ),
+        ]
+        run_plan(plan, console, show_hints)
+        click.echo(f"{name} removed.")
+
+    @click.command()
+    @click.argument("name", type=str)
+    @click.option(
+        "--secrets-file",
+        type=str,
+        required=True,
+        help="Secrets file containing client_id and client_secret",
+    )
+    @click_option_show_hints
+    @pass_method_obj
+    def update_provider(
+        self,
+        deployment: Deployment,
+        name: str,
+        secrets_file: str,
+        show_hints: bool
+    ):
+        """Update external provider client secrets."""
+        try:
+            cfg = self.provider_config(deployment, self.SSO_CONFIG_KEY)
+        except ConfigItemNotFoundException:
+            cfg = {}
+
+        if name not in cfg:
+            click.echo(f"{name} does not exist.")
+            return
+        
+        jhelper = JujuHelper(deployment.juju_controller)
+        plan = [
+            TerraformInitStep(deployment.get_tfhelper(self.tfplan)),
+            UpdateExternalProviderStep(
+                deployment=deployment,
+                config=FeatureConfig(),
+                jhelper=jhelper,
+                feature=self,
+                provider_name=name,
+                secrets_file=secrets_file,
+            ),
+        ]
+        run_plan(plan, console, show_hints)
+        click.echo(f"{name} updated.")
+
+    @click.command()
     @pass_method_obj
     def get_openid_redirect_uri(self, deployment: Deployment):
         """Get the OpenID redirect URI."""
-        jhelper = JujuHelper(deployment.get_connected_controller())
+        jhelper = JujuHelper(deployment.juju_controller)
         redirect_uri = self._get_openid_redirect_uri(jhelper)
         click.echo(f"{redirect_uri}")
 
@@ -210,14 +324,12 @@ class SSOFeature(OpenStackControlPlaneFeature):
         action_cmd = "get-admin-account"
 
         try:
-            unit = run_sync(jhelper.get_leader_unit(app, OPENSTACK_MODEL))
+            unit = jhelper.get_leader_unit(app, OPENSTACK_MODEL)
         except LeaderNotFoundException:
             raise click.ClickException(f"Unable to get {app} leader")
         
         try:
-            action_result = run_sync(
-                jhelper.run_action(unit, OPENSTACK_MODEL, action_cmd)
-            )
+            action_result = jhelper.run_action(unit, OPENSTACK_MODEL, action_cmd)
         except ActionFailedException as e:
             raise click.ClickException(
                 "Unable to retrieve admin account data from Keystone service"
@@ -241,6 +353,8 @@ class SSOFeature(OpenStackControlPlaneFeature):
             "init.sso": [
                 {"name": "list-providers", "command": self.list_providers},
                 {"name": "add-provider", "command": self.add_provider},
+                {"name": "remove-provider", "command": self.remove_provider},
+                {"name": "update-provider", "command": self.update_provider},
                 {"name": "get-oidc-redirect-uri", "command": self.get_openid_redirect_uri},
             ],
         }

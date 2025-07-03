@@ -1,7 +1,7 @@
 import yaml
-import asyncio
+import queue
 import click
-from sunbeam.clusterd.client import Client
+from sunbeam.core.openstack import OPENSTACK_MODEL
 from sunbeam.core.common import (
     FORMAT_TABLE,
     FORMAT_YAML,
@@ -9,8 +9,6 @@ from sunbeam.core.common import (
     Result,
     ResultType,
     read_config,
-    run_plan,
-    str_presenter,
     update_config,
     update_status_background,
 )
@@ -18,19 +16,15 @@ from sunbeam.core.juju import (
     JujuHelper,
     JujuStepHelper,
     JujuWaitException,
-    TimeoutException,
-    run_sync,
 )
-from sunbeam.core.terraform import TerraformException, TerraformInitStep
+from sunbeam.core.terraform import TerraformException
 from sunbeam.core.deployment import Deployment
-from sunbeam.core.manifest import CharmManifest, FeatureConfig, SoftwareConfig
+from sunbeam.core.manifest import FeatureConfig
 from sunbeam.core import questions
 from rich.status import Status
 from rich.console import Console
 from sunbeam.features.interface.v1.openstack import (
     OpenStackControlPlaneFeature,
-    WaitForApplicationsStep,
-    TerraformPlanLocation,
 )
 from sunbeam.clusterd.service import (
     ConfigItemNotFoundException,
@@ -43,6 +37,199 @@ APPLICATION_DEPLOY_TIMEOUT = 900  # 15 minutes
 APPLICATION_REMOVE_TIMEOUT = 300  # 5 minutes
 
 console = Console()
+
+
+class RemoveExternalProviderStep(BaseStep, JujuStepHelper):
+
+    _CONFIG = "FeatureSSOExternalIDPConfig-%s"
+
+    def __init__(
+        self,
+        deployment: Deployment,
+        config: FeatureConfig,
+        jhelper: JujuHelper,
+        feature: OpenStackControlPlaneFeature,
+        provider_name,
+    ):
+        super().__init__("Remove external IDP", f"Removing external IDP {provider_name}")
+        self.client = deployment.get_client()
+        self.jhelper = jhelper
+        self.config = config
+        self.feature = feature
+        self.deployment = deployment
+        self.tfhelper = deployment.get_tfhelper(self.feature.tfplan)
+        self._provider_name = provider_name
+
+    def run(self, status: Status | None = None) -> Result:
+        """Apply terraform configuration to deploy openstack application."""
+        config_key = self.feature.get_tfvar_config_key()
+        try:
+            tfvars = read_config(self.client, config_key)
+        except ConfigItemNotFoundException:
+            tfvars = {}
+        tfvars.update(self.feature.set_tfvars_on_enable(self.deployment, self.config))
+
+        feature_key = self.feature.SSO_CONFIG_KEY
+        try:
+            cfg = read_config(self.client, feature_key)
+        except ConfigItemNotFoundException:
+            cfg = {}
+
+        if self._provider_name in tfvars.get("sso-providers", {}):
+            del tfvars["sso-providers"][self._provider_name]
+            self.tfhelper.write_tfvars(tfvars)
+            update_config(self.client, config_key, tfvars)
+        else:
+            return Result(ResultType.FAILED, "Provider not found")
+
+        if self._provider_name in cfg:
+            del cfg[self._provider_name]
+            update_config(self.client, feature_key, cfg)
+        
+        try:
+            self.tfhelper.apply()
+        except TerraformException as e:
+            return Result(ResultType.FAILED, str(e))
+        
+        try:
+            self.jhelper.wait_application_gone(
+                [f"keystone-idp-{self._provider_name}"],
+                OPENSTACK_MODEL,
+                timeout=APPLICATION_REMOVE_TIMEOUT,
+            )
+            self.jhelper.wait_until_active(
+                OPENSTACK_MODEL,
+                ["keystone"],
+                timeout=APPLICATION_REMOVE_TIMEOUT,
+            )
+        except (JujuWaitException, TimeoutError) as e:
+            return Result(ResultType.FAILED, str(e))
+
+        return Result(ResultType.COMPLETED)
+    
+
+class UpdateExternalProviderStep(BaseStep, JujuStepHelper):
+
+    _CONFIG = "FeatureSSOExternalIDPConfig-%s"
+
+    def __init__(
+        self,
+        deployment: Deployment,
+        config: FeatureConfig,
+        jhelper: JujuHelper,
+        feature: OpenStackControlPlaneFeature,
+        provider_name,
+        secrets_file,
+    ):
+        super().__init__("Update external IDP", f"Updating external IDP {provider_name}")
+        self.client = deployment.get_client()
+        self.jhelper = jhelper
+        self.config = config
+        self.feature = feature
+        self.deployment = deployment
+        self.tfhelper = deployment.get_tfhelper(self.feature.tfplan)
+        self._provider_name = provider_name
+        self._secrets_file = secrets_file
+
+    def _load_secrets_file(self, cfgFile: str) -> dict:
+        data = {}
+        with open(cfgFile) as fd:
+            try:
+                data = yaml.safe_load(fd)
+            except Exception as err:
+                raise click.ClickException(f"Invalid config supplied: {err}")
+
+        if not data or type(data) is not dict:
+            raise click.ClickException(
+                "Invalid config supplied. Config must contain key/value pairs")
+        
+        required_configs = {
+            "client_id": None,
+            "client_secret": None,
+        }
+
+        for key, _ in required_configs.items():
+            val = data.get(
+                key,
+                data.get(
+                    key.replace("_", "-"),
+                    None,
+                )
+            )
+            if not val:
+                raise click.ClickException(f"Missing {key} in secrets file")
+            required_configs[key] = val
+        return required_configs
+
+    def run(self, status: Status | None = None) -> Result:
+        """Apply terraform configuration to deploy openstack application."""
+        config_key = self.feature.get_tfvar_config_key()
+        try:
+            tfvars = read_config(self.client, config_key)
+        except ConfigItemNotFoundException:
+            tfvars = {}
+        tfvars.update(self.feature.set_tfvars_on_enable(self.deployment, self.config))
+
+        feature_key = self.feature.SSO_CONFIG_KEY
+        try:
+            cfg = read_config(self.client, feature_key)
+        except ConfigItemNotFoundException:
+            cfg = {}
+
+        if self._provider_name not in cfg:
+            return Result(ResultType.FAILED, "Provider not found")
+        
+        provider_type = cfg[self._provider_name].get("provider_type", None)
+        if not provider_type or provider_type == "canonical":
+            return Result(
+                ResultType.FAILED,
+                (f"Provider {self._provider_name} of type "
+                 "{provider_type} cannot be updated"))
+
+        if "config" not in cfg[self._provider_name]:
+            return Result(
+                ResultType.FAILED,
+                f"Provider {self._provider_name} is in an invalid state")
+
+        try:
+            secrets = self._load_secrets_file(self._secrets_file)
+        except Exception as e:
+            return Result(ResultType.FAILED, str(e))
+
+        cfg[self._provider_name]["config"]["client_id"] = secrets["client_id"]
+        cfg[self._provider_name]["config"]["client_secret"] = secrets["client_secret"]
+        update_config(self.client, feature_key, cfg)
+
+        if tfvars.get("sso-providers"):
+            tfvars["sso-providers"][self._provider_name] = cfg[self._provider_name]["config"]
+        else:
+            tfvars["sso-providers"] = {
+                self._provider_name: cfg[self._provider_name]["config"]
+            }
+        self.tfhelper.write_tfvars(tfvars)
+        update_config(self.client, config_key, tfvars)
+        try:
+            self.tfhelper.apply()
+        except TerraformException as e:
+            return Result(ResultType.FAILED, str(e))
+        
+        charm_name = "keystone-idp-{}".format(self._provider_name)
+        apps = ["keystone", "horizon", charm_name]
+        app_queue: queue.Queue[str] = queue.Queue(maxsize=len(apps))
+        task = update_status_background(self, apps, app_queue, status)
+        try:
+            self.jhelper.wait_until_active(
+                OPENSTACK_MODEL,
+                apps,
+                timeout=APPLICATION_DEPLOY_TIMEOUT,
+                queue=app_queue,
+            )
+        except (JujuWaitException, TimeoutError) as e:
+            return Result(ResultType.FAILED, str(e))
+        finally:
+            task.stop()
+
+        return Result(ResultType.COMPLETED)
 
 
 class AddExternalProviderStep(BaseStep, JujuStepHelper):
@@ -60,11 +247,12 @@ class AddExternalProviderStep(BaseStep, JujuStepHelper):
         provider_name,
         configFile,
     ):
-        super().__init__("Add external IDP", "Adding external IDP")
+        super().__init__("Add external IDP", f"Adding external IDP {provider_name}")
         self.client = deployment.get_client()
         self.jhelper = jhelper
         self.config = config
         self.feature = feature
+        self.deployment = deployment
         self.tfhelper = deployment.get_tfhelper(self.feature.tfplan)
 
         self._provider_name = provider_name
@@ -104,14 +292,14 @@ class AddExternalProviderStep(BaseStep, JujuStepHelper):
         }
         if not config:
             return preseed
-        data = None
+        data = {}
         with open(config) as fd:
             try:
                 data = yaml.safe_load(fd)
             except Exception as err:
                 raise click.ClickException(f"Invalid config supplied: {err}")
         
-        if not data:
+        if not data or type(data) is not dict:
             return preseed
         
         for key, val in preseed.items():
@@ -168,7 +356,8 @@ class AddExternalProviderStep(BaseStep, JujuStepHelper):
             )
         
         if not self._label:
-            self._label = f"Log in with {self._provider_name}"
+            label_name = self._provider_name.capitalize()
+            self._label = f"Log in with {label_name}"
 
         variables["label"] = self._label
         variables["client_id"] = self._client_id
@@ -274,7 +463,6 @@ class AddExternalProviderStep(BaseStep, JujuStepHelper):
             }
         
         for provider, data in cfg.items():
-            print(provider, data)
             if tfvars.get("sso-providers"):
                 tfvars["sso-providers"][provider] = data["config"]
             else:
@@ -290,21 +478,18 @@ class AddExternalProviderStep(BaseStep, JujuStepHelper):
 
         charm_name = "keystone-idp-{}".format(self._provider_name)
         apps = ["keystone", "horizon", charm_name]
-        queue: asyncio.queues.Queue[str] = asyncio.queues.Queue(maxsize=len(apps))
-        task = run_sync(update_status_background(self, apps, queue, status))
+        app_queue: queue.Queue[str] = queue.Queue(maxsize=len(apps))
+        task = update_status_background(self, apps, app_queue, status)
         try:
-            run_sync(
-                self.jhelper.wait_until_active(
-                    self.model,
-                    apps,
-                    timeout=APPLICATION_DEPLOY_TIMEOUT,
-                    queue=queue,
-                )
+            self.jhelper.wait_until_active(
+                OPENSTACK_MODEL,
+                apps,
+                timeout=APPLICATION_DEPLOY_TIMEOUT,
+                queue=app_queue,
             )
-        except (JujuWaitException, TimeoutException) as e:
+        except (JujuWaitException, TimeoutError) as e:
             return Result(ResultType.FAILED, str(e))
         finally:
-            if not task.done():
-                task.cancel()
+            task.stop()
 
         return Result(ResultType.COMPLETED)
