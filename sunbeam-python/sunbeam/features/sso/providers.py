@@ -1,4 +1,5 @@
 import yaml
+import asyncio
 import click
 from sunbeam.clusterd.client import Client
 from sunbeam.core.common import (
@@ -10,6 +11,8 @@ from sunbeam.core.common import (
     read_config,
     run_plan,
     str_presenter,
+    update_config,
+    update_status_background,
 )
 from sunbeam.core.juju import (
     JujuHelper,
@@ -18,13 +21,26 @@ from sunbeam.core.juju import (
     TimeoutException,
     run_sync,
 )
+from sunbeam.core.terraform import TerraformException, TerraformInitStep
+from sunbeam.core.deployment import Deployment
+from sunbeam.core.manifest import CharmManifest, FeatureConfig, SoftwareConfig
 from sunbeam.core import questions
 from rich.status import Status
 from rich.console import Console
+from sunbeam.features.interface.v1.openstack import (
+    OpenStackControlPlaneFeature,
+    WaitForApplicationsStep,
+    TerraformPlanLocation,
+)
+from sunbeam.clusterd.service import (
+    ConfigItemNotFoundException,
+)
 
 _GOOGLE_ISSUER_URL = "https://accounts.google.com"
 _ENTRA_ISSUER_URL = "https://login.microsoftonline.com/%s/v2.0"
 _OKTA_ISSUER_URL = "https://%s.okta.com"
+APPLICATION_DEPLOY_TIMEOUT = 900  # 15 minutes
+APPLICATION_REMOVE_TIMEOUT = 300  # 5 minutes
 
 console = Console()
 
@@ -35,15 +51,22 @@ class AddExternalProviderStep(BaseStep, JujuStepHelper):
 
     def __init__(
         self,
-        client: Client,
+        deployment: Deployment,
+        config: FeatureConfig,
         jhelper: JujuHelper,
+        feature: OpenStackControlPlaneFeature,
         provider_type,
         provider_protocol,
         provider_name,
-        config,
+        configFile,
     ):
-        self.client = client
+        super().__init__("Add external IDP", "Adding external IDP")
+        self.client = deployment.get_client()
         self.jhelper = jhelper
+        self.config = config
+        self.feature = feature
+        self.tfhelper = deployment.get_tfhelper(self.feature.tfplan)
+
         self._provider_name = provider_name
         self._provider_type = provider_type
         self._provider_protocol = provider_protocol
@@ -64,13 +87,12 @@ class AddExternalProviderStep(BaseStep, JujuStepHelper):
                 "Microsoft tenant ID"
             ),
         }
-        self._preseed = self._compose_preseed_from_config(config)
+        self._preseed = self._compose_preseed_from_config(configFile)
 
         self._issuer_url = None
         self._client_id = None
         self._client_secret = None
         self._label = None
-        self._charm_provider = None
     
     def _compose_preseed_from_config(self, config: str):
         preseed = {
@@ -185,6 +207,9 @@ class AddExternalProviderStep(BaseStep, JujuStepHelper):
         
         variables["microsoft_tenant"] = tenant_id
         return variables
+    
+    def _ask_canonical(self, q_bank: questions.QuestionBank, variables: dict):
+        pass
 
     def prompt(
         self,
@@ -225,4 +250,61 @@ class AddExternalProviderStep(BaseStep, JujuStepHelper):
             variables)
 
     def run(self, status: Status | None = None) -> Result:
-        pass
+        config_key = self.feature.get_tfvar_config_key()
+        try:
+            tfvars = read_config(self.client, config_key)
+        except ConfigItemNotFoundException:
+            tfvars = {}
+        tfvars.update(self.feature.set_tfvars_on_enable(self.deployment, self.config))
+
+        feature_key = self.feature.SSO_CONFIG_KEY
+        try:
+            cfg = read_config(self.client, feature_key)
+        except ConfigItemNotFoundException:
+            cfg = {}
+
+        idp = cfg.get(self._provider_name)
+        if idp:
+            cfg[self._provider_name]["config"] = self._charm_config
+        else:
+            cfg[self._provider_name] = {
+                "config": self._charm_config,
+                "provider_type": self._provider_type,
+                "provider_proto": self._provider_protocol,
+            }
+        
+        for provider, data in cfg.items():
+            print(provider, data)
+            if tfvars.get("sso-providers"):
+                tfvars["sso-providers"][provider] = data["config"]
+            else:
+                tfvars["sso-providers"] = {provider : data["config"]}
+        self.tfhelper.write_tfvars(tfvars)
+        update_config(self.client, feature_key, cfg)
+        update_config(self.client, config_key, tfvars)
+
+        try:
+            self.tfhelper.apply()
+        except TerraformException as e:
+            return Result(ResultType.FAILED, str(e))
+
+        charm_name = "keystone-idp-{}".format(self._provider_name)
+        apps = ["keystone", "horizon", charm_name]
+        queue: asyncio.queues.Queue[str] = asyncio.queues.Queue(maxsize=len(apps))
+        task = run_sync(update_status_background(self, apps, queue, status))
+        try:
+            run_sync(
+                self.jhelper.wait_until_active(
+                    self.model,
+                    apps,
+                    timeout=APPLICATION_DEPLOY_TIMEOUT,
+                    queue=queue,
+                )
+            )
+        except (JujuWaitException, TimeoutException) as e:
+            return Result(ResultType.FAILED, str(e))
+        finally:
+            if not task.done():
+                task.cancel()
+
+        return Result(ResultType.COMPLETED)

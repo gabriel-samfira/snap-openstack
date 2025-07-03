@@ -44,6 +44,7 @@ class SSOFeature(OpenStackControlPlaneFeature):
     requires = {
         FeatureRequirement('tls.ca'),
     }
+    SSO_CONFIG_KEY = "SSOFeatureConfigKey"
     
     def provider_config(self, deployment: Deployment, cfg: str) -> dict:
         """Return stored provider configuration."""
@@ -159,7 +160,7 @@ class SSOFeature(OpenStackControlPlaneFeature):
     @click.option(
         "--config",
         type=str,
-        required=True,
+        required=False,
         help="SSO provider configuration",
     )
     @click_option_show_hints
@@ -174,21 +175,27 @@ class SSOFeature(OpenStackControlPlaneFeature):
         show_hints: bool,
     ) -> None:
         """Add a new SSO Provider."""
+        jhelper = JujuHelper(deployment.get_connected_controller())
         if provider_type != "canonical":
-            ext_prov = AddExternalProviderStep(
-                provider_type,
-                provider_protocol,
-                name,
-                config,
+            step = AddExternalProviderStep(
+                deployment=deployment,
+                config=FeatureConfig(),
+                jhelper=jhelper,
+                feature=self,
+                provider_type=provider_type,
+                provider_protocol=provider_protocol,
+                provider_name=name,
+                configFile=config,
             )
-        # jhelper = JujuHelper(deployment.get_connected_controller())
-        # plan = [
-        #     TerraformInitStep(deployment.get_tfhelper(self.tfplan)),
-        #     # AddLDAPDomainStep(deployment, FeatureConfig(), jhelper, self, charm_config),
-        # ]
-
-        # run_plan(plan, console, show_hints)
-        # click.echo(f"{name} added.")
+        else:
+            click.echo(f"not yet.")
+            return
+        plan = [
+            TerraformInitStep(deployment.get_tfhelper(self.tfplan)),
+            step,
+        ]
+        run_plan(plan, console, show_hints)
+        click.echo(f"{name} added.")
 
     @click.command()
     @pass_method_obj
