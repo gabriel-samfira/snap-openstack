@@ -10,10 +10,11 @@ from sunbeam.features.interface.v1.base import (
 from rich.table import Table
 from sunbeam.core.deployment import Deployment
 from packaging.version import Version
-from sunbeam.core.terraform import TerraformException, TerraformInitStep
+from sunbeam.core.terraform import TerraformInitStep
 from sunbeam.utils import pass_method_obj, click_option_show_hints
 from sunbeam.clusterd.service import ConfigItemNotFoundException
 from sunbeam.core.openstack import OPENSTACK_MODEL
+from sunbeam.features.interface.v1.base import BaseFeatureGroup
 from sunbeam.features.interface.v1.openstack import (
     OpenStackControlPlaneFeature,
     TerraformPlanLocation,
@@ -32,12 +33,30 @@ from sunbeam.core.juju import (
     LeaderNotFoundException,
 )
 from .providers import (
-    AddExternalProviderStep,
+    AddCanonicalProviderStep,
+    AddGenericProviderStep,
+    AddGoogleProviderStep,
+    AddOktaProviderStep,
+    AddEntraProviderStep,
     RemoveExternalProviderStep,
     UpdateExternalProviderStep,
 )
 
 console = Console()
+
+class SSOFeatureGroup(BaseFeatureGroup):
+    name = "tls"
+
+    @click.group()
+    @pass_method_obj
+    def enable_group(self, deployment: Deployment) -> None:
+        """Enable tls group."""
+
+    @click.group()
+    @pass_method_obj
+    def disable_group(self, deployment: Deployment) -> None:
+        """Disable TLS group."""
+
 
 class SSOFeature(OpenStackControlPlaneFeature):
     version = Version("0.0.1")
@@ -161,7 +180,7 @@ class SSOFeature(OpenStackControlPlaneFeature):
         
         if format == FORMAT_TABLE:
             table = Table()
-            table.add_column("Provider Name")
+            table.add_column("Provider ID")
             table.add_column("Type")
             table.add_column("Protocol")
             for provider, data in results.items():
@@ -179,7 +198,7 @@ class SSOFeature(OpenStackControlPlaneFeature):
     @click.argument(
         "provider-type",
         type=click.Choice(
-            ["canonical", "google", "entra", "okta"],
+            ["canonical", "google", "entra", "okta", "generic"],
             case_sensitive=False,
         ),
     )
@@ -219,20 +238,29 @@ class SSOFeature(OpenStackControlPlaneFeature):
             return
         
         jhelper = JujuHelper(deployment.juju_controller)
-        if provider_type != "canonical":
-            step = AddExternalProviderStep(
-                deployment=deployment,
-                config=FeatureConfig(),
-                jhelper=jhelper,
-                feature=self,
-                provider_type=provider_type,
-                provider_protocol=provider_protocol,
-                provider_name=name,
-                configFile=config,
-            )
-        else:
-            click.echo(f"not yet.")
-            return
+
+        step_map = {
+            "google": AddGoogleProviderStep,
+            "entra": AddEntraProviderStep,
+            "okta": AddOktaProviderStep,
+            "generic": AddGenericProviderStep,
+            "canonical": AddCanonicalProviderStep,
+        }
+
+        stepCls = step_map.get(provider_type)
+        if not stepCls:
+            raise click.ClickException(f"Cannot handle {provider_type}")
+
+        step = stepCls(
+            deployment,
+            FeatureConfig(),
+            jhelper,
+            self,
+            provider_protocol,
+            name,
+            config,
+        )
+
         plan = [
             TerraformInitStep(deployment.get_tfhelper(self.tfplan)),
             step,
@@ -351,10 +379,10 @@ class SSOFeature(OpenStackControlPlaneFeature):
         return {
             "init": [{"name": "sso", "command": self.sso_groups}],
             "init.sso": [
-                {"name": "list-providers", "command": self.list_providers},
-                {"name": "add-provider", "command": self.add_provider},
-                {"name": "remove-provider", "command": self.remove_provider},
-                {"name": "update-provider", "command": self.update_provider},
+                {"name": "list", "command": self.list_providers},
+                {"name": "add", "command": self.add_provider},
+                {"name": "remove", "command": self.remove_provider},
+                {"name": "update", "command": self.update_provider},
                 {"name": "get-oidc-redirect-uri", "command": self.get_openid_redirect_uri},
             ],
         }

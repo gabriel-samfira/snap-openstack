@@ -232,6 +232,356 @@ class UpdateExternalProviderStep(BaseStep, JujuStepHelper):
         return Result(ResultType.COMPLETED)
 
 
+class _BaseProviderStep(BaseStep, JujuStepHelper):
+
+    _CONFIG = "FeatureSSOExternalIDPConfig-%s"
+
+    def __init__(
+        self,
+        name: str,
+        description: str,
+        provider_type: str,
+        deployment: Deployment,
+        config: FeatureConfig,
+        jhelper: JujuHelper,
+        feature: OpenStackControlPlaneFeature,
+        provider_protocol: str,
+        provider_name: str,
+        configFile: str,
+    ):
+        super().__init__(name, description)
+        self.client = deployment.get_client()
+        self.jhelper = jhelper
+        self.config = config
+        self.feature = feature
+        self.deployment = deployment
+        self.tfhelper = deployment.get_tfhelper(self.feature.tfplan)
+
+        self._provider_name = provider_name
+        self._provider_type = provider_type
+        self._provider_protocol = provider_protocol
+        self._questions = {}
+        self._preseed = self._compose_preseed_from_config(configFile)
+
+    def _get_preseed_map(self):
+        raise NotImplementedError()
+    
+    def _compose_preseed_from_config(self, config: str):
+        preseed = self._get_preseed_map()
+
+        if not config:
+            return preseed
+        data = {}
+        with open(config) as fd:
+            try:
+                data = yaml.safe_load(fd)
+            except Exception as err:
+                raise click.ClickException(f"Invalid config supplied: {err}")
+        
+        if not data or type(data) is not dict:
+            return preseed
+        
+        for key, val in preseed.items():
+            preseed[key] = data.get(
+                key,
+                data.get(
+                    key.replace("_", "-"),
+                    None,
+                )
+            )
+        return preseed
+    
+    def has_prompts(self) -> bool:
+        """Returns true if the step has prompts that it can ask the user."""
+        return True
+    
+    def is_skip(self, status: Status | None = None) -> Result:
+        """Determines if the step should be skipped or not.
+
+        :return: ResultType.SKIPPED if the Step should be skipped,
+                ResultType.COMPLETED or ResultType.FAILED otherwise
+        """
+        return Result(ResultType.COMPLETED)
+
+    @property
+    def _charm_config(self):
+        raise NotImplementedError()
+    
+    def _ask(self, q_bank: questions.QuestionBank, variables: dict):
+        raise NotImplementedError()
+
+    def prompt(
+        self,
+        console: Console | None = None,
+        show_hint: bool = False,
+    ) -> None:
+        """Prompt the user for any data not in the config.
+
+        Based on the provider type, prompt the user for any options
+        that are not specified in the config.
+
+        :param console: the console to prompt on
+        :type console: rich.console.Console (Optional)
+        """
+
+        variables = questions.load_answers(
+            self.client,
+            self._CONFIG % self._provider_name)
+
+        sso_bank = questions.QuestionBank(
+            questions=self._questions,
+            console=console,
+            preseed=self._preseed,
+            previous_answers=variables,
+            show_hint=show_hint,
+        )
+
+        variables = self._ask(sso_bank, variables)
+
+        questions.write_answers(
+            self.client,
+            self._CONFIG % self._provider_name,
+            variables)
+
+
+class _BaseExternalProviderStep(_BaseProviderStep):
+
+    def __init__(self, *args):
+        super().__init__(*args)
+        self._issuer_url = None
+        self._client_id = None
+        self._client_secret = None
+        self._label = None
+        self._questions = {
+            "client_id": questions.PromptQuestion(
+                "OAuth client-id"
+            ),
+            "client_secret": questions.PromptQuestion(
+                "OAuth client-secret"
+            ),
+            "label": questions.PromptQuestion(
+                "Label for this provider"
+            ),
+        }
+
+    def _get_preseed_map(self):
+        return {
+            "client_id": None,
+            "client_secret": None,
+            "label": None,
+        }
+    
+    def _ask(self, q_bank: questions.QuestionBank, variables: dict):
+        self._client_id = q_bank.client_id.ask()
+        self._client_secret = q_bank.client_secret.ask()
+        self._label = q_bank.label.ask()
+
+        if not all([self._client_id, self._client_secret]):
+            raise click.ClickException(
+                "client_id and client_secret are mandatory"
+            )
+        
+        if not self._label:
+            label_name = self._provider_name.capitalize()
+            self._label = f"Log in with {label_name}"
+
+        variables["label"] = self._label
+        variables["client_id"] = self._client_id
+        variables["client_secret"] = self._client_secret
+        return variables
+
+    @property
+    def _charm_config(self):
+        if not all([
+            self._issuer_url,
+            self._client_id,
+            self._client_secret,
+            self._label,
+            self._provider_name,
+        ]):
+            raise click.ClickException(
+                "invalid state for provider step"
+            )
+        return {
+            "provider": "generic",
+            "provider_id": self._provider_name,
+            "client_id": self._client_id,
+            "client_secret": self._client_secret,
+            "label": self._label,
+            "issuer_url": self._issuer_url,
+        }
+
+    def run(self, status: Status | None = None) -> Result:
+        config_key = self.feature.get_tfvar_config_key()
+        try:
+            tfvars = read_config(self.client, config_key)
+        except ConfigItemNotFoundException:
+            tfvars = {}
+        tfvars.update(self.feature.set_tfvars_on_enable(self.deployment, self.config))
+
+        feature_key = self.feature.SSO_CONFIG_KEY
+        try:
+            cfg = read_config(self.client, feature_key)
+        except ConfigItemNotFoundException:
+            cfg = {}
+
+        idp = cfg.get(self._provider_name)
+        if idp:
+            cfg[self._provider_name]["config"] = self._charm_config
+        else:
+            cfg[self._provider_name] = {
+                "config": self._charm_config,
+                "provider_type": self._provider_type,
+                "provider_proto": self._provider_protocol,
+            }
+        update_config(self.client, feature_key, cfg)
+        
+        for provider, data in cfg.items():
+            if tfvars.get("sso-providers"):
+                tfvars["sso-providers"][provider] = data["config"]
+            else:
+                tfvars["sso-providers"] = {provider : data["config"]}
+        self.tfhelper.write_tfvars(tfvars)
+        update_config(self.client, config_key, tfvars)
+
+        try:
+            self.tfhelper.apply()
+        except TerraformException as e:
+            return Result(ResultType.FAILED, str(e))
+
+        charm_name = f"keystone-idp-{self._provider_name}"
+        apps = ["keystone", "horizon", charm_name]
+        app_queue: queue.Queue[str] = queue.Queue(maxsize=len(apps))
+        task = update_status_background(self, apps, app_queue, status)
+        try:
+            self.jhelper.wait_until_active(
+                OPENSTACK_MODEL,
+                apps,
+                timeout=APPLICATION_DEPLOY_TIMEOUT,
+                queue=app_queue,
+            )
+        except (JujuWaitException, TimeoutError) as e:
+            return Result(ResultType.FAILED, str(e))
+        finally:
+            task.stop()
+
+        return Result(ResultType.COMPLETED)
+
+
+class AddGoogleProviderStep(_BaseExternalProviderStep):
+
+    def __init__(self, *args, **kw):
+        super().__init__(
+            "Add google external IDP",
+            "Adding google external IDP",
+            "google",
+            *args,
+            **kw,
+        )
+        self._issuer_url = _GOOGLE_ISSUER_URL
+
+
+class AddOktaProviderStep(_BaseExternalProviderStep):
+
+    def __init__(self, *args, **kw):
+        super().__init__(
+            "Add okta external IDP",
+            "Adding okta external IDP",
+            "okta",
+            *args,
+            **kw,
+        )
+        self._questions["okta_org"] = questions.PromptQuestion(
+            "Your Okta org (eg: dev-123456)"
+        )
+    
+    def _get_preseed_map(self):
+        preseed = super()._get_preseed_map()
+        preseed["okta_org"] = None
+        return preseed
+
+    def _ask(self, q_bank: questions.QuestionBank, variables: dict):
+        variables = super()._ask(q_bank, variables)
+        okta_org = q_bank.okta_org.ask()
+        if not okta_org:
+            raise click.ClickException(
+                "okta_org is mandatory"
+            )
+        self._issuer_url = _OKTA_ISSUER_URL % okta_org
+        variables["okta_org"] = okta_org
+        return variables
+
+
+class AddEntraProviderStep(_BaseExternalProviderStep):
+
+    def __init__(self, *args, **kw):
+        super().__init__(
+            "Add entra external IDP",
+            "Adding entra external IDP",
+            "entra",
+            *args,
+            **kw,
+        )
+        self._questions["microsoft_tenant"] = questions.PromptQuestion(
+            "Microsoft tenant ID"
+        )
+    
+    def _get_preseed_map(self):
+        preseed = super()._get_preseed_map()
+        preseed["microsoft_tenant"] = None
+        return preseed
+
+    def _ask(self, q_bank: questions.QuestionBank, variables: dict):
+        variables = super()._ask(q_bank, variables)
+        tenant_id = q_bank.microsoft_tenant.ask()
+        if not tenant_id:
+            raise click.ClickException(
+                "microsoft_tenant is mandatory"
+            )
+        self._issuer_url = _ENTRA_ISSUER_URL % tenant_id
+        variables["microsoft_tenant"] = tenant_id
+        return variables
+
+
+class AddGenericProviderStep(_BaseExternalProviderStep):
+
+    def __init__(self, *args, **kw):
+        super().__init__(
+            "Add generic external IDP",
+            "Adding generic external IDP",
+            "generic",
+            *args,
+            **kw,
+        )
+        self._questions["issuer_url"] = questions.PromptQuestion(
+            "OpenID Issuer URL",
+            description=("The issuer URL is a unique identifier for an "
+                            "OpenID provider. The URL must be https, it "
+                            "may have an optional path and is used when "
+                            "the provider type is set to generic."),
+        ),
+    
+    def _get_preseed_map(self):
+        preseed = super()._get_preseed_map()
+        preseed["issuer_url"] = None
+        return preseed
+
+    def _ask(self, q_bank: questions.QuestionBank, variables: dict):
+        variables = super()._ask(q_bank, variables)
+        issuer_url = q_bank.issuer_url.ask()
+        if not issuer_url:
+            raise click.ClickException(
+                "issuer_url is mandatory"
+            )
+        self._issuer_url = issuer_url
+        variables["issuer_url"] = issuer_url
+        return variables
+
+
+class AddCanonicalProviderStep(_BaseProviderStep):
+    pass
+
+
 class AddExternalProviderStep(BaseStep, JujuStepHelper):
 
     _CONFIG = "FeatureSSOExternalIDPConfig-%s"
@@ -274,6 +624,31 @@ class AddExternalProviderStep(BaseStep, JujuStepHelper):
             "microsoft_tenant": questions.PromptQuestion(
                 "Microsoft tenant ID"
             ),
+            "issuer_url": questions.PromptQuestion(
+                "OpenID Issuer URL",
+                description=("The issuer URL is a unique identifier for an "
+                             "OpenID provider. The URL must be https, it "
+                             "may have an optional path and is used when "
+                             "the provider type is set to generic."),
+            ),
+            "oauth_offer": questions.PromptQuestion(
+                "OAuth juju offer",
+                description=("This is a juju offer created in another juju "
+                             "model. The offer must expose a relation which "
+                             "implements the 'oauth' interface. This is "
+                             "mandatory when the provider type is set to "
+                             "'canonical' and is typically used to relate "
+                             "to a hydra charm deployed by canonical identity "
+                             "platform, but other chrms may implement the "
+                             "same interface."),
+            ),
+            "cert_offer": questions.PromptQuestion(
+                "OAuth cert authority",
+                description=("When relating to a charm that implements the "
+                             "'oauth' interface, you may need to also relate "
+                             "to a certificate authority that implements the "
+                             "send-cert interface"),
+            ),
         }
         self._preseed = self._compose_preseed_from_config(configFile)
 
@@ -281,6 +656,8 @@ class AddExternalProviderStep(BaseStep, JujuStepHelper):
         self._client_id = None
         self._client_secret = None
         self._label = None
+        self._oauth_offer = None
+        self._cert_offer = None
     
     def _compose_preseed_from_config(self, config: str):
         preseed = {
@@ -289,6 +666,9 @@ class AddExternalProviderStep(BaseStep, JujuStepHelper):
             "client_secret": None,
             "label": None,
             "microsoft_tenant": None,
+            "issuer_url": None,
+            "oauth_offer": None,
+            "cert_offer": None,
         }
         if not config:
             return preseed
@@ -324,8 +704,7 @@ class AddExternalProviderStep(BaseStep, JujuStepHelper):
         """
         return Result(ResultType.COMPLETED)
     
-    @property
-    def _charm_config(self):
+    def _charm_config_external(self):
         if not all([
             self._issuer_url,
             self._client_id,
@@ -334,7 +713,7 @@ class AddExternalProviderStep(BaseStep, JujuStepHelper):
             self._provider_name,
         ]):
             raise click.ClickException(
-                "invalid state for external provider step"
+                "invalid state for provider step"
             )
         return {
             "provider": "generic",
@@ -344,6 +723,22 @@ class AddExternalProviderStep(BaseStep, JujuStepHelper):
             "label": self._label,
             "issuer_url": self._issuer_url,
         }
+
+    def _charm_config_canonical(self):
+        if not self._oauth_offer:
+            raise click.ClickException(
+                "invalid state for provider step"
+            )
+        return {
+            "oauth_offer": self._oauth_offer,
+            "cert_offer": self._cert_offer,
+        }
+
+    @property
+    def _charm_config(self):
+        if self._provider_type == "canonical":
+            return self._charm_config_canonical()
+        return self._charm_config_external()
 
     def _ask_common(self, q_bank: questions.QuestionBank, variables: dict):
         self._client_id = q_bank.client_id.ask()
@@ -364,6 +759,16 @@ class AddExternalProviderStep(BaseStep, JujuStepHelper):
         variables["client_secret"] = self._client_secret
         return variables
     
+    def _ask_generic(self, q_bank: questions.QuestionBank, variables: dict):
+        variables = self._ask_common(q_bank, variables)
+        self._issuer_url = q_bank.issuer_url.ask()
+        if not self._issuer_url:
+            raise click.ClickException(
+                "issuer_url is mandatory for generic IDPs"
+            )
+        variables["issuer_url"] = self._issuer_url
+        return variables
+
     def _ask_okta(self, q_bank: questions.QuestionBank, variables: dict):
         variables = self._ask_common(q_bank, variables)
         okta_org = q_bank.okta_org.ask()
@@ -398,7 +803,18 @@ class AddExternalProviderStep(BaseStep, JujuStepHelper):
         return variables
     
     def _ask_canonical(self, q_bank: questions.QuestionBank, variables: dict):
-        pass
+        self._oauth_offer = q_bank.oauth_offer.ask()
+        self._cert_offer = q_bank.cert_offer.ask()
+        if not self._oauth_offer:
+            raise click.ClickException(
+                "oauth_offer is mandatory"
+            )
+
+        variables["oauth_offer"] = self._oauth_offer
+        if self._cert_offer:
+            variables["cert_offer"] = self._cert_offer
+
+        return variables
 
     def prompt(
         self,
@@ -438,6 +854,30 @@ class AddExternalProviderStep(BaseStep, JujuStepHelper):
             self._CONFIG % self._provider_name,
             variables)
 
+    def _run_external(self, status: Status | None = None) -> Result:
+        try:
+            self.tfhelper.apply()
+        except TerraformException as e:
+            return Result(ResultType.FAILED, str(e))
+
+        charm_name = f"keystone-idp-{self._provider_name}"
+        apps = ["keystone", "horizon", charm_name]
+        app_queue: queue.Queue[str] = queue.Queue(maxsize=len(apps))
+        task = update_status_background(self, apps, app_queue, status)
+        try:
+            self.jhelper.wait_until_active(
+                OPENSTACK_MODEL,
+                apps,
+                timeout=APPLICATION_DEPLOY_TIMEOUT,
+                queue=app_queue,
+            )
+        except (JujuWaitException, TimeoutError) as e:
+            return Result(ResultType.FAILED, str(e))
+        finally:
+            task.stop()
+
+        return Result(ResultType.COMPLETED)
+
     def run(self, status: Status | None = None) -> Result:
         config_key = self.feature.get_tfvar_config_key()
         try:
@@ -461,6 +901,7 @@ class AddExternalProviderStep(BaseStep, JujuStepHelper):
                 "provider_type": self._provider_type,
                 "provider_proto": self._provider_protocol,
             }
+        update_config(self.client, feature_key, cfg)
         
         for provider, data in cfg.items():
             if tfvars.get("sso-providers"):
@@ -468,28 +909,8 @@ class AddExternalProviderStep(BaseStep, JujuStepHelper):
             else:
                 tfvars["sso-providers"] = {provider : data["config"]}
         self.tfhelper.write_tfvars(tfvars)
-        update_config(self.client, feature_key, cfg)
         update_config(self.client, config_key, tfvars)
 
-        try:
-            self.tfhelper.apply()
-        except TerraformException as e:
-            return Result(ResultType.FAILED, str(e))
-
-        charm_name = "keystone-idp-{}".format(self._provider_name)
-        apps = ["keystone", "horizon", charm_name]
-        app_queue: queue.Queue[str] = queue.Queue(maxsize=len(apps))
-        task = update_status_background(self, apps, app_queue, status)
-        try:
-            self.jhelper.wait_until_active(
-                OPENSTACK_MODEL,
-                apps,
-                timeout=APPLICATION_DEPLOY_TIMEOUT,
-                queue=app_queue,
-            )
-        except (JujuWaitException, TimeoutError) as e:
-            return Result(ResultType.FAILED, str(e))
-        finally:
-            task.stop()
-
-        return Result(ResultType.COMPLETED)
+        if self._provider_type == "canonical":
+            return self._run_external(status)
+        return self._run_external(status)
