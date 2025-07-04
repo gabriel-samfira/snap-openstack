@@ -15,6 +15,7 @@ from sunbeam.utils import pass_method_obj, click_option_show_hints
 from sunbeam.clusterd.service import ConfigItemNotFoundException
 from sunbeam.core.openstack import OPENSTACK_MODEL
 from sunbeam.features.interface.v1.base import BaseFeatureGroup
+from sunbeam.steps.juju import RemoveSaasApplicationsStep
 from sunbeam.features.interface.v1.openstack import (
     OpenStackControlPlaneFeature,
     TerraformPlanLocation,
@@ -31,6 +32,7 @@ from sunbeam.core.juju import (
     ActionFailedException,
     JujuHelper,
     LeaderNotFoundException,
+    JujuWaitException,
 )
 from .providers import (
     AddCanonicalProviderStep,
@@ -40,6 +42,7 @@ from .providers import (
     AddEntraProviderStep,
     RemoveExternalProviderStep,
     UpdateExternalProviderStep,
+    APPLICATION_REMOVE_TIMEOUT,
 )
 
 console = Console()
@@ -146,12 +149,30 @@ class SSOFeature(OpenStackControlPlaneFeature):
         no_prompt: bool,
     ) -> None:
         """Disable SSO."""
-        config = self.provider_config(deployment)
-        providers = config.get("sso-providers", {})
-        if not no_prompt and providers:
-            msg = ("You have multiple SSO providers enabled. "
-            "This will disable all of them. Are you sure?")
+        config = self.provider_config(deployment, self.SSO_CONFIG_KEY)
+        if not no_prompt and config:
+            msg = ("You have one or more SSO providers enabled. "
+            "This action will disable all of them. Are you sure?")
             click.confirm(msg, abort=True)
+        saas_to_remove = []
+        jhelper = JujuHelper(deployment.juju_controller)
+        for provider, cfg in config.items():
+            if cfg.get("provider_type", None) == "canonical":
+                saas_to_remove.append(provider)
+                saas_to_remove.append(f"{provider}-cert")
+
+        tfhelper = deployment.get_tfhelper(self.tfplan)
+        remove_saas_plan = [
+            TerraformInitStep(tfhelper),
+            RemoveSaasApplicationsStep(
+                jhelper,
+                OPENSTACK_MODEL,
+                saas_apps_to_delete=saas_to_remove,
+                offering_interfaces=["oauth", "certificate_transfer"],
+                wait_timeout=APPLICATION_REMOVE_TIMEOUT,
+            ),
+        ]
+        run_plan(remove_saas_plan, console, show_hints)
         self.disable_feature(deployment, show_hints)
         update_config(deployment.get_client(), self.SSO_CONFIG_KEY, {})
     
@@ -279,22 +300,37 @@ class SSOFeature(OpenStackControlPlaneFeature):
         except ConfigItemNotFoundException:
             cfg = {}
 
-        if name not in cfg:
+        provider = cfg.get(name)
+        if not provider:
             click.echo(f"{name} does not exist.")
             return
-
         jhelper = JujuHelper(deployment.juju_controller)
-        plan = [
-            TerraformInitStep(deployment.get_tfhelper(self.tfplan)),
-            RemoveExternalProviderStep(
+        prov_type = provider.get("provider_type", None)
+        if prov_type == "canonical":
+            step = RemoveSaasApplicationsStep(
+                jhelper,
+                OPENSTACK_MODEL,
+                saas_apps_to_delete=[name, f"{name}-cert"],
+                offering_interfaces=["oauth", "certificate_transfer"],
+                wait_timeout=APPLICATION_REMOVE_TIMEOUT,
+            )
+        else:
+            step = RemoveExternalProviderStep(
                 deployment=deployment,
                 config=FeatureConfig(),
                 jhelper=jhelper,
                 feature=self,
                 provider_name=name,
-            ),
+            )
+        plan = [
+            TerraformInitStep(deployment.get_tfhelper(self.tfplan)),
+            step,
         ]
+
         run_plan(plan, console, show_hints)
+        if prov_type == "canonical":
+            del cfg[name]
+            update_config(deployment.get_client(), self.SSO_CONFIG_KEY, cfg)
         click.echo(f"{name} removed.")
 
     @click.command()

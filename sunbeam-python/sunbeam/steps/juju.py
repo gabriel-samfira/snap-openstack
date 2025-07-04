@@ -1992,6 +1992,7 @@ class RemoveSaasApplicationsStep(BaseStep):
         offering_model: str | None = None,
         offering_interfaces: list | None = None,
         saas_apps_to_delete: list | None = None,
+        wait_timeout: int | None = None,
     ):
         super().__init__(
             f"Purge SAAS Offers: {model}", f"Purging SAAS Offers from {model}"
@@ -2002,6 +2003,7 @@ class RemoveSaasApplicationsStep(BaseStep):
         self.offering_interfaces = offering_interfaces
         self.saas_apps_to_delete = saas_apps_to_delete
         self._remote_app_to_delete: list[str] = []
+        self._wait_timeout = wait_timeout
 
     def _get_remote_apps_from_model(
         self,
@@ -2089,6 +2091,15 @@ class RemoveSaasApplicationsStep(BaseStep):
             self.model,
         )
         self.jhelper.remove_saas(self.model, *self._remote_app_to_delete)
+        if self._wait_timeout:
+            try:
+                self.jhelper.wait_app_endpoint_gone(
+                    self._remote_app_to_delete,
+                    self.model,
+                    timeout=self._wait_timeout,
+                )
+            except (JujuWaitException, TimeoutError) as e:
+                return Result(ResultType.FAILED, str(e))
         return Result(ResultType.COMPLETED)
 
 
