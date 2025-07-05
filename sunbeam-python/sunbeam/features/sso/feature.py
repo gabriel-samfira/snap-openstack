@@ -32,7 +32,6 @@ from sunbeam.core.juju import (
     ActionFailedException,
     JujuHelper,
     LeaderNotFoundException,
-    JujuWaitException,
 )
 from .providers import (
     AddCanonicalProviderStep,

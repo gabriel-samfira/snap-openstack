@@ -1,5 +1,6 @@
 import yaml
 import queue
+import requests
 import click
 from sunbeam.core.openstack import OPENSTACK_MODEL
 from sunbeam.core.common import (
@@ -79,8 +80,6 @@ class RemoveExternalProviderStep(BaseStep, JujuStepHelper):
             del tfvars["sso-providers"][self._provider_name]
             self.tfhelper.write_tfvars(tfvars)
             update_config(self.client, config_key, tfvars)
-        else:
-            return Result(ResultType.FAILED, "Provider not found")
 
         if self._provider_name in cfg:
             del cfg[self._provider_name]
@@ -105,6 +104,12 @@ class RemoveExternalProviderStep(BaseStep, JujuStepHelper):
         except (JujuWaitException, TimeoutError) as e:
             return Result(ResultType.FAILED, str(e))
 
+        # Clear answers on delete.
+        questions.write_answers(
+            self.client,
+            self._CONFIG % self._provider_name,
+            {},
+        )
         return Result(ResultType.COMPLETED)
     
 
@@ -356,8 +361,9 @@ class _BaseExternalProviderStep(_BaseProviderStep):
             "client_id": questions.PromptQuestion(
                 "OAuth client-id"
             ),
-            "client_secret": questions.PromptQuestion(
-                "OAuth client-secret"
+            "client_secret": questions.PasswordPromptQuestion(
+                "OAuth client-secret",
+                password=True,
             ),
             "label": questions.PromptQuestion(
                 "Label for this provider"
@@ -411,6 +417,40 @@ class _BaseExternalProviderStep(_BaseProviderStep):
             "issuer_url": self._issuer_url,
         }
 
+    def _validate_oidc_config(self, idp: dict) -> None:
+        issuer_url = idp.get("config", {}).get("issuer_url", None)
+        if not issuer_url:
+            raise ValueError(
+                f"could not find issuer_url for {self._provider_name}",
+            )
+
+        issuer_url = issuer_url.rstrip("/")
+        discovery_ep = f"{issuer_url}/.well-known/openid-configuration"
+        cfg_req = requests.get(discovery_ep)
+        cfg_req.raise_for_status()
+        data = cfg_req.json()
+
+        # see: https://openid.net/specs/openid-connect-discovery-1_0.html
+        mandatory_openid_fields = [
+            "issuer",
+            "authorization_endpoint",
+            "token_endpoint",
+            "jwks_uri",
+            "response_types_supported",
+            "subject_types_supported",
+            "id_token_signing_alg_values_supported",
+        ]
+        missing = []
+        for required in mandatory_openid_fields:
+            if required not in data:
+                missing.append(required)
+
+        if missing:
+            raise ValueError(
+                (f"Missing required fields in OIDC discovery document: "
+                 f"{', '.join(missing)}"),
+            )
+
     def run(self, status: Status | None = None) -> Result:
         config_key = self.feature.get_tfvar_config_key()
         try:
@@ -435,7 +475,12 @@ class _BaseExternalProviderStep(_BaseProviderStep):
                 "provider_proto": self._provider_protocol,
             }
         update_config(self.client, feature_key, cfg)
-        
+
+        try:
+            self._validate_oidc_config(cfg[self._provider_name])
+        except Exception as e:
+            return Result(ResultType.FAILED, str(e))
+
         for provider, data in cfg.items():
             if data.get("provider_type", None) == "canonical":
                 continue
