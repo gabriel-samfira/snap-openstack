@@ -290,11 +290,11 @@ class _BaseProviderStep(BaseStep, JujuStepHelper):
         if not config:
             return preseed
         data = {}
-        with open(config) as fd:
-            try:
+        try:
+            with open(config) as fd:
                 data = yaml.safe_load(fd)
-            except Exception as err:
-                raise click.ClickException(f"Invalid config supplied: {err}")
+        except Exception as err:
+            raise click.ClickException(f"Invalid config supplied: {err}")
 
         if not data or type(data) is not dict:
             return preseed
