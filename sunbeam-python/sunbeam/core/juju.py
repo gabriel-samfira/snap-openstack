@@ -1028,7 +1028,8 @@ class JujuHelper:
             )
             self._wait(_ready_callback, juju, delay=MODEL_DELAY, timeout=timeout)
 
-    def wait_app_endpoint_gone(self,
+    def wait_app_endpoint_gone(
+        self,
         names: list[str],
         model: str,
         timeout: int | None = None,
@@ -1040,7 +1041,7 @@ class JujuHelper:
         if there are any integration to it, it might take a while for those
         relations to be removed, in which time the application endpoint may
         still be present in the model.
-        
+
         :names: List of application endpoints to wait for to dissapear
         :model: Name of the model where the application endpoint is located
         :timeout: Waiting timeout in seconds
@@ -1450,10 +1451,12 @@ class JujuHelper:
 
     def consume_offer(self, model: str, offer_url: str, alias: str = ""):
         """Consume an offer.
-        
+
         This function allows the consumtion of an offer with an alias.
         """
-        args = [offer_url,]
+        args = [
+            offer_url,
+        ]
         if alias:
             args.append(alias)
         with self._model(model) as juju:

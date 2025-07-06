@@ -1,50 +1,56 @@
+# SPDX-FileCopyrightText: 2025 - Canonical Ltd
+# SPDX-License-Identifier: Apache-2.0
+
 import click
 import pydantic
 import yaml
-
-from rich.console import Console
-from sunbeam.core.manifest import CharmManifest, FeatureConfig, SoftwareConfig
-from sunbeam.features.interface.v1.base import (
-    FeatureRequirement,
-)
-from rich.table import Table
-from sunbeam.core.deployment import Deployment
 from packaging.version import Version
-from sunbeam.core.terraform import TerraformInitStep
-from sunbeam.utils import pass_method_obj, click_option_show_hints
+from rich.console import Console
+from rich.table import Table
+
+# Local application imports
 from sunbeam.clusterd.service import ConfigItemNotFoundException
-from sunbeam.core.openstack import OPENSTACK_MODEL
-from sunbeam.features.interface.v1.base import BaseFeatureGroup
-from sunbeam.steps.juju import RemoveSaasApplicationsStep
-from sunbeam.features.interface.v1.openstack import (
-    OpenStackControlPlaneFeature,
-    TerraformPlanLocation,
-)
 from sunbeam.core.common import (
     FORMAT_TABLE,
     FORMAT_YAML,
     read_config,
     run_plan,
-    update_config,
     str_presenter,
+    update_config,
 )
+from sunbeam.core.deployment import Deployment
 from sunbeam.core.juju import (
     ActionFailedException,
     JujuHelper,
     LeaderNotFoundException,
 )
+from sunbeam.core.manifest import CharmManifest, FeatureConfig, SoftwareConfig
+from sunbeam.core.openstack import OPENSTACK_MODEL
+from sunbeam.core.terraform import TerraformInitStep
+from sunbeam.features.interface.v1.base import (
+    BaseFeatureGroup,
+    FeatureRequirement,
+)
+from sunbeam.features.interface.v1.openstack import (
+    OpenStackControlPlaneFeature,
+    TerraformPlanLocation,
+)
+from sunbeam.steps.juju import RemoveSaasApplicationsStep
+from sunbeam.utils import click_option_show_hints, pass_method_obj
+
 from .providers import (
+    APPLICATION_REMOVE_TIMEOUT,
     AddCanonicalProviderStep,
+    AddEntraProviderStep,
     AddGenericProviderStep,
     AddGoogleProviderStep,
     AddOktaProviderStep,
-    AddEntraProviderStep,
     RemoveExternalProviderStep,
     UpdateExternalProviderStep,
-    APPLICATION_REMOVE_TIMEOUT,
 )
 
 console = Console()
+
 
 class SSOFeatureGroup(BaseFeatureGroup):
     name = "tls"
@@ -65,10 +71,10 @@ class SSOFeature(OpenStackControlPlaneFeature):
     name = "sso"
     tf_plan_location = TerraformPlanLocation.SUNBEAM_TERRAFORM_REPO
     requires = {
-        FeatureRequirement('tls.ca'),
+        FeatureRequirement("tls.ca"),
     }
     SSO_CONFIG_KEY = "SSOFeatureConfigKey"
-    
+
     def provider_config(self, deployment: Deployment, cfg: str = "") -> dict:
         """Return stored provider configuration."""
         try:
@@ -77,7 +83,7 @@ class SSOFeature(OpenStackControlPlaneFeature):
         except ConfigItemNotFoundException:
             provider_config = {}
         return provider_config
-    
+
     def default_software_overrides(self) -> SoftwareConfig:
         """Feature software configuration."""
         return SoftwareConfig(
@@ -102,14 +108,14 @@ class SSOFeature(OpenStackControlPlaneFeature):
     def set_application_names(self, deployment: Deployment) -> list:
         """Application names handled by the terraform plan."""
         return []
-    
+
     def set_tfvars_on_enable(
         self, deployment: Deployment, config: pydantic.BaseModel
     ) -> dict:
         """Set terraform variables to enable the application."""
         tfvars: dict[str, None | bool] = {"keystone-to-trusted-dashboard": True}
         return tfvars
-    
+
     def set_tfvars_on_disable(self, deployment: Deployment) -> dict:
         """Set terraform variables to disable the application."""
         tfvars: dict[str, None | bool | dict] = {
@@ -117,22 +123,20 @@ class SSOFeature(OpenStackControlPlaneFeature):
             "sso-providers": {},
         }
         return tfvars
-    
+
     def set_tfvars_on_resize(
         self, deployment: Deployment, config: FeatureConfig
     ) -> dict:
         """Set terraform variables to resize the application."""
         return {}
-    
+
     @click.command()
     @click_option_show_hints
     @pass_method_obj
-    def enable_cmd(
-        self, deployment: Deployment, show_hints: bool
-    ) -> None:
+    def enable_cmd(self, deployment: Deployment, show_hints: bool) -> None:
         """Enable SSO."""
         self.enable_feature(deployment, FeatureConfig(), show_hints)
-    
+
     @click.command()
     @click_option_show_hints
     @click.option(
@@ -150,8 +154,10 @@ class SSOFeature(OpenStackControlPlaneFeature):
         """Disable SSO."""
         config = self.provider_config(deployment, self.SSO_CONFIG_KEY)
         if not no_prompt and config:
-            msg = ("You have one or more SSO providers enabled. "
-            "This action will disable all of them. Are you sure?")
+            msg = (
+                "You have one or more SSO providers enabled. "
+                "This action will disable all of them. Are you sure?"
+            )
             click.confirm(msg, abort=True)
         saas_to_remove = []
         jhelper = JujuHelper(deployment.juju_controller)
@@ -174,7 +180,7 @@ class SSOFeature(OpenStackControlPlaneFeature):
         run_plan(remove_saas_plan, console, show_hints)
         self.disable_feature(deployment, show_hints)
         update_config(deployment.get_client(), self.SSO_CONFIG_KEY, {})
-    
+
     @click.command()
     @click.option(
         "--format",
@@ -197,7 +203,7 @@ class SSOFeature(OpenStackControlPlaneFeature):
                 "protocol": v.get("provider_proto", "unknown"),
                 "issuer_url": v.get("config", {}).get("issuer_url", "unknown"),
             }
-        
+
         if format == FORMAT_TABLE:
             table = Table()
             table.add_column("Provider ID")
@@ -225,7 +231,9 @@ class SSOFeature(OpenStackControlPlaneFeature):
     @click.argument(
         "provider-protocol",
         type=click.Choice(
-            ["openid",],
+            [
+                "openid",
+            ],
             case_sensitive=False,
         ),
     )
@@ -256,7 +264,7 @@ class SSOFeature(OpenStackControlPlaneFeature):
         if name in cfg:
             click.echo(f"{name} is already enabled.")
             return
-        
+
         jhelper = JujuHelper(deployment.juju_controller)
 
         step_map = {
@@ -267,11 +275,11 @@ class SSOFeature(OpenStackControlPlaneFeature):
             "canonical": AddCanonicalProviderStep,
         }
 
-        stepCls = step_map.get(provider_type)
-        if not stepCls:
+        step_cls = step_map.get(provider_type)
+        if not step_cls:
             raise click.ClickException(f"Cannot handle {provider_type}")
 
-        step = stepCls(
+        step = step_cls(
             deployment,
             FeatureConfig(),
             jhelper,
@@ -343,11 +351,7 @@ class SSOFeature(OpenStackControlPlaneFeature):
     @click_option_show_hints
     @pass_method_obj
     def update_provider(
-        self,
-        deployment: Deployment,
-        name: str,
-        secrets_file: str,
-        show_hints: bool
+        self, deployment: Deployment, name: str, secrets_file: str, show_hints: bool
     ):
         """Update external provider client secrets."""
         try:
@@ -358,7 +362,7 @@ class SSOFeature(OpenStackControlPlaneFeature):
         if name not in cfg:
             click.echo(f"{name} does not exist.")
             return
-        
+
         jhelper = JujuHelper(deployment.juju_controller)
         plan = [
             TerraformInitStep(deployment.get_tfhelper(self.tfplan)),
@@ -390,10 +394,10 @@ class SSOFeature(OpenStackControlPlaneFeature):
             unit = jhelper.get_leader_unit(app, OPENSTACK_MODEL)
         except LeaderNotFoundException:
             raise click.ClickException(f"Unable to get {app} leader")
-        
+
         try:
             action_result = jhelper.run_action(unit, OPENSTACK_MODEL, action_cmd)
-        except ActionFailedException as e:
+        except ActionFailedException:
             raise click.ClickException(
                 "Unable to retrieve admin account data from Keystone service"
             )
@@ -418,6 +422,9 @@ class SSOFeature(OpenStackControlPlaneFeature):
                 {"name": "add", "command": self.add_provider},
                 {"name": "remove", "command": self.remove_provider},
                 {"name": "update", "command": self.update_provider},
-                {"name": "get-oidc-redirect-uri", "command": self.get_openid_redirect_uri},
+                {
+                    "name": "get-oidc-redirect-uri",
+                    "command": self.get_openid_redirect_uri,
+                },
             ],
         }
