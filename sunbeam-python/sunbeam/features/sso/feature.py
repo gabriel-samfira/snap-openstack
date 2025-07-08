@@ -13,6 +13,7 @@ from sunbeam.clusterd.service import ConfigItemNotFoundException
 from sunbeam.core.common import (
     FORMAT_TABLE,
     FORMAT_YAML,
+    BaseStep,
     read_config,
     run_plan,
     str_presenter,
@@ -40,6 +41,7 @@ from sunbeam.utils import click_option_show_hints, pass_method_obj
 
 from .providers import (
     APPLICATION_REMOVE_TIMEOUT,
+    SSO_CONFIG_KEY,
     AddCanonicalProviderStep,
     AddEntraProviderStep,
     AddGenericProviderStep,
@@ -70,10 +72,6 @@ class SSOFeature(OpenStackControlPlaneFeature):
     version = Version("0.0.1")
     name = "sso"
     tf_plan_location = TerraformPlanLocation.SUNBEAM_TERRAFORM_REPO
-    requires = {
-        FeatureRequirement("tls.ca"),
-    }
-    SSO_CONFIG_KEY = "SSOFeatureConfigKey"
 
     def provider_config(self, deployment: Deployment, cfg: str = "") -> dict:
         """Return stored provider configuration."""
@@ -152,7 +150,7 @@ class SSOFeature(OpenStackControlPlaneFeature):
         no_prompt: bool,
     ) -> None:
         """Disable SSO."""
-        config = self.provider_config(deployment, self.SSO_CONFIG_KEY)
+        config = self.provider_config(deployment, SSO_CONFIG_KEY)
         if not no_prompt and config:
             msg = (
                 "You have one or more SSO providers enabled. "
@@ -179,7 +177,7 @@ class SSOFeature(OpenStackControlPlaneFeature):
         ]
         run_plan(remove_saas_plan, console, show_hints)
         self.disable_feature(deployment, show_hints)
-        update_config(deployment.get_client(), self.SSO_CONFIG_KEY, {})
+        update_config(deployment.get_client(), SSO_CONFIG_KEY, {})
 
     @click.command()
     @click.option(
@@ -192,7 +190,7 @@ class SSOFeature(OpenStackControlPlaneFeature):
     def list_providers(self, deployment: Deployment, format: str) -> None:
         """List SSO providers."""
         try:
-            cfg = self.provider_config(deployment, self.SSO_CONFIG_KEY)
+            cfg = self.provider_config(deployment, SSO_CONFIG_KEY)
         except ConfigItemNotFoundException:
             cfg = {}
 
@@ -257,7 +255,7 @@ class SSOFeature(OpenStackControlPlaneFeature):
     ) -> None:
         """Add a new SSO Provider."""
         try:
-            cfg = self.provider_config(deployment, self.SSO_CONFIG_KEY)
+            cfg = self.provider_config(deployment, SSO_CONFIG_KEY)
         except ConfigItemNotFoundException:
             cfg = {}
 
@@ -279,6 +277,13 @@ class SSOFeature(OpenStackControlPlaneFeature):
         if not step_cls:
             raise click.ClickException(f"Cannot handle {provider_type}")
 
+        charm_config: dict[str, str] = {}
+        try:
+            with open(config) as fd:
+                charm_config = yaml.safe_load(fd)
+        except Exception as err:
+            raise click.ClickException(f"Invalid config supplied: {err}")
+
         step = step_cls(
             deployment,
             FeatureConfig(),
@@ -286,7 +291,7 @@ class SSOFeature(OpenStackControlPlaneFeature):
             self,
             provider_protocol,
             name,
-            config,
+            charm_config,
         )
 
         plan = [
@@ -303,7 +308,7 @@ class SSOFeature(OpenStackControlPlaneFeature):
     def remove_provider(self, deployment: Deployment, name: str, show_hints: bool):
         """Remove a SSO provider."""
         try:
-            cfg = self.provider_config(deployment, self.SSO_CONFIG_KEY)
+            cfg = self.provider_config(deployment, SSO_CONFIG_KEY)
         except ConfigItemNotFoundException:
             cfg = {}
 
@@ -312,32 +317,35 @@ class SSOFeature(OpenStackControlPlaneFeature):
             click.echo(f"{name} does not exist.")
             return
         jhelper = JujuHelper(deployment.juju_controller)
+        plan: list[BaseStep] = [
+            TerraformInitStep(deployment.get_tfhelper(self.tfplan)),
+        ]
         prov_type = provider.get("provider_type", None)
         if prov_type == "canonical":
-            step = RemoveSaasApplicationsStep(
-                jhelper,
-                OPENSTACK_MODEL,
-                saas_apps_to_delete=[name, f"{name}-cert"],
-                offering_interfaces=["oauth", "certificate_transfer"],
-                wait_timeout=APPLICATION_REMOVE_TIMEOUT,
+            plan.append(
+                RemoveSaasApplicationsStep(
+                    jhelper,
+                    OPENSTACK_MODEL,
+                    saas_apps_to_delete=[name, f"{name}-cert"],
+                    offering_interfaces=["oauth", "certificate_transfer"],
+                    wait_timeout=APPLICATION_REMOVE_TIMEOUT,
+                )
             )
         else:
-            step = RemoveExternalProviderStep(
-                deployment=deployment,
-                config=FeatureConfig(),
-                jhelper=jhelper,
-                feature=self,
-                provider_name=name,
+            plan.append(
+                RemoveExternalProviderStep(
+                    deployment=deployment,
+                    config=FeatureConfig(),
+                    jhelper=jhelper,
+                    feature=self,
+                    provider_name=name,
+                )
             )
-        plan = [
-            TerraformInitStep(deployment.get_tfhelper(self.tfplan)),
-            step,
-        ]
 
         run_plan(plan, console, show_hints)
         if prov_type == "canonical":
             del cfg[name]
-            update_config(deployment.get_client(), self.SSO_CONFIG_KEY, cfg)
+            update_config(deployment.get_client(), SSO_CONFIG_KEY, cfg)
         click.echo(f"{name} removed.")
 
     @click.command()
@@ -355,13 +363,20 @@ class SSOFeature(OpenStackControlPlaneFeature):
     ):
         """Update external provider client secrets."""
         try:
-            cfg = self.provider_config(deployment, self.SSO_CONFIG_KEY)
+            cfg = self.provider_config(deployment, SSO_CONFIG_KEY)
         except ConfigItemNotFoundException:
             cfg = {}
 
         if name not in cfg:
             click.echo(f"{name} does not exist.")
             return
+
+        secrets: dict[str, str] = {}
+        try:
+            with open(secrets_file) as fd:
+                secrets = yaml.safe_load(fd)
+        except Exception as e:
+            raise click.ClickException(f"Invalid config supplied: {e}")
 
         jhelper = JujuHelper(deployment.juju_controller)
         plan = [
@@ -372,7 +387,7 @@ class SSOFeature(OpenStackControlPlaneFeature):
                 jhelper=jhelper,
                 feature=self,
                 provider_name=name,
-                secrets_file=secrets_file,
+                secrets=secrets,
             ),
         ]
         run_plan(plan, console, show_hints)

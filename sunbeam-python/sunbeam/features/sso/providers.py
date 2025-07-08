@@ -5,7 +5,6 @@ import queue
 
 import click
 import requests
-import yaml
 from rich.console import Console
 from rich.status import Status
 
@@ -36,6 +35,8 @@ from sunbeam.features.interface.v1.openstack import (
 
 _GOOGLE_ISSUER_URL = "https://accounts.google.com"
 _ENTRA_ISSUER_URL = "https://login.microsoftonline.com/%s/v2.0"
+_CONFIG = "FeatureSSOExternalIDPConfig-%s"
+SSO_CONFIG_KEY = "SSOFeatureConfigKey"
 _OKTA_ISSUER_URL = "https://%s.okta.com"
 APPLICATION_DEPLOY_TIMEOUT = 900  # 15 minutes
 APPLICATION_REMOVE_TIMEOUT = 300  # 5 minutes
@@ -44,8 +45,6 @@ console = Console()
 
 
 class RemoveExternalProviderStep(BaseStep, JujuStepHelper):
-    _CONFIG = "FeatureSSOExternalIDPConfig-%s"
-
     def __init__(
         self,
         deployment: Deployment,
@@ -75,9 +74,8 @@ class RemoveExternalProviderStep(BaseStep, JujuStepHelper):
             tfvars = {}
         tfvars.update(self.feature.set_tfvars_on_enable(self.deployment, self.config))
 
-        feature_key = self.feature.SSO_CONFIG_KEY
         try:
-            cfg = read_config(self.client, feature_key)
+            cfg = read_config(self.client, SSO_CONFIG_KEY)
         except ConfigItemNotFoundException:
             cfg = {}
 
@@ -88,7 +86,7 @@ class RemoveExternalProviderStep(BaseStep, JujuStepHelper):
 
         if self._provider_name in cfg:
             del cfg[self._provider_name]
-            update_config(self.client, feature_key, cfg)
+            update_config(self.client, SSO_CONFIG_KEY, cfg)
 
         try:
             self.tfhelper.apply()
@@ -112,15 +110,13 @@ class RemoveExternalProviderStep(BaseStep, JujuStepHelper):
         # Clear answers on delete.
         questions.write_answers(
             self.client,
-            self._CONFIG % self._provider_name,
+            _CONFIG % self._provider_name,
             {},
         )
         return Result(ResultType.COMPLETED)
 
 
 class UpdateExternalProviderStep(BaseStep, JujuStepHelper):
-    _CONFIG = "FeatureSSOExternalIDPConfig-%s"
-
     def __init__(
         self,
         deployment: Deployment,
@@ -128,7 +124,7 @@ class UpdateExternalProviderStep(BaseStep, JujuStepHelper):
         jhelper: JujuHelper,
         feature: OpenStackControlPlaneFeature,
         provider_name,
-        secrets_file,
+        secrets: dict[str, str],
     ):
         super().__init__(
             "Update external IDP",
@@ -141,17 +137,10 @@ class UpdateExternalProviderStep(BaseStep, JujuStepHelper):
         self.deployment = deployment
         self.tfhelper = deployment.get_tfhelper(self.feature.tfplan)
         self._provider_name = provider_name
-        self._secrets_file = secrets_file
+        self._secrets = self._validate_secrets(secrets)
 
-    def _load_secrets_file(self, cfg_file: str) -> dict:
-        data = {}
-        with open(cfg_file) as fd:
-            try:
-                data = yaml.safe_load(fd)
-            except Exception as err:
-                raise click.ClickException(f"Invalid config supplied: {err}")
-
-        if not data or type(data) is not dict:
+    def _validate_secrets(self, data: dict[str, str]):
+        if not data:
             raise click.ClickException(
                 "Invalid config supplied. Config must contain key/value pairs"
             )
@@ -183,9 +172,8 @@ class UpdateExternalProviderStep(BaseStep, JujuStepHelper):
             tfvars = {}
         tfvars.update(self.feature.set_tfvars_on_enable(self.deployment, self.config))
 
-        feature_key = self.feature.SSO_CONFIG_KEY
         try:
-            cfg = read_config(self.client, feature_key)
+            cfg = read_config(self.client, SSO_CONFIG_KEY)
         except ConfigItemNotFoundException:
             cfg = {}
 
@@ -208,14 +196,11 @@ class UpdateExternalProviderStep(BaseStep, JujuStepHelper):
                 f"Provider {self._provider_name} is in an invalid state",
             )
 
-        try:
-            secrets = self._load_secrets_file(self._secrets_file)
-        except Exception as e:
-            return Result(ResultType.FAILED, str(e))
-
-        cfg[self._provider_name]["config"]["client_id"] = secrets["client_id"]
-        cfg[self._provider_name]["config"]["client_secret"] = secrets["client_secret"]
-        update_config(self.client, feature_key, cfg)
+        cfg[self._provider_name]["config"]["client_id"] = self._secrets["client_id"]
+        cfg[self._provider_name]["config"]["client_secret"] = self._secrets[
+            "client_secret"
+        ]
+        update_config(self.client, SSO_CONFIG_KEY, cfg)
 
         if tfvars.get("sso-providers"):
             tfvars["sso-providers"][self._provider_name] = cfg[self._provider_name][
@@ -252,8 +237,6 @@ class UpdateExternalProviderStep(BaseStep, JujuStepHelper):
 
 
 class _BaseProviderStep(BaseStep, JujuStepHelper):
-    _CONFIG = "FeatureSSOExternalIDPConfig-%s"
-
     def __init__(
         self,
         name: str,
@@ -265,7 +248,7 @@ class _BaseProviderStep(BaseStep, JujuStepHelper):
         feature: OpenStackControlPlaneFeature,
         provider_protocol: str,
         provider_name: str,
-        config_file: str,
+        charm_config: dict[str, str],
     ):
         super().__init__(name, description)
         self.client = deployment.get_client()
@@ -278,25 +261,16 @@ class _BaseProviderStep(BaseStep, JujuStepHelper):
         self._provider_name = provider_name
         self._provider_type = provider_type
         self._provider_protocol = provider_protocol
-        self._questions = {}
-        self._preseed = self._compose_preseed_from_config(config_file)
+        self._questions: dict[str, questions.Question] = {}
+        self._preseed = self._compose_preseed_from_config(charm_config)
 
     def _get_preseed_map(self):
         raise NotImplementedError()
 
-    def _compose_preseed_from_config(self, config: str):
+    def _compose_preseed_from_config(self, data: dict[str, str]):
         preseed = self._get_preseed_map()
 
-        if not config:
-            return preseed
-        data = {}
-        try:
-            with open(config) as fd:
-                data = yaml.safe_load(fd)
-        except Exception as err:
-            raise click.ClickException(f"Invalid config supplied: {err}")
-
-        if not data or type(data) is not dict:
+        if not data:
             return preseed
 
         for key, val in preseed.items():
@@ -343,7 +317,7 @@ class _BaseProviderStep(BaseStep, JujuStepHelper):
         """
         variables = questions.load_answers(
             self.client,
-            self._CONFIG % self._provider_name,
+            _CONFIG % self._provider_name,
         )
 
         sso_bank = questions.QuestionBank(
@@ -353,12 +327,8 @@ class _BaseProviderStep(BaseStep, JujuStepHelper):
             previous_answers=variables,
             show_hint=show_hint,
         )
-
         variables = self._ask(sso_bank, variables)
-
-        questions.write_answers(
-            self.client, self._CONFIG % self._provider_name, variables
-        )
+        questions.write_answers(self.client, _CONFIG % self._provider_name, variables)
 
 
 class _BaseExternalProviderStep(_BaseProviderStep):
@@ -374,7 +344,7 @@ class _BaseExternalProviderStep(_BaseProviderStep):
                 "OAuth client-secret",
                 password=True,
             ),
-            "label": questions.PromptQuestion("Label for this provider"),
+            "label": questions.PromptQuestion("Label for this provider (optional)"),
         }
 
     def _get_preseed_map(self):
@@ -423,6 +393,7 @@ class _BaseExternalProviderStep(_BaseProviderStep):
         }
 
     def _validate_oidc_config(self, idp: dict) -> None:
+        """Basic check for openid connect discovery document."""
         issuer_url = idp.get("config", {}).get("issuer_url", None)
         if not issuer_url:
             raise ValueError(
@@ -466,9 +437,8 @@ class _BaseExternalProviderStep(_BaseProviderStep):
             tfvars = {}
         tfvars.update(self.feature.set_tfvars_on_enable(self.deployment, self.config))
 
-        feature_key = self.feature.SSO_CONFIG_KEY
         try:
-            cfg = read_config(self.client, feature_key)
+            cfg = read_config(self.client, SSO_CONFIG_KEY)
         except ConfigItemNotFoundException:
             cfg = {}
 
@@ -481,7 +451,7 @@ class _BaseExternalProviderStep(_BaseProviderStep):
                 "provider_type": self._provider_type,
                 "provider_proto": self._provider_protocol,
             }
-        update_config(self.client, feature_key, cfg)
+        update_config(self.client, SSO_CONFIG_KEY, cfg)
 
         try:
             self._validate_oidc_config(cfg[self._provider_name])
@@ -495,6 +465,7 @@ class _BaseExternalProviderStep(_BaseProviderStep):
                 tfvars["sso-providers"][provider] = data["config"]
             else:
                 tfvars["sso-providers"] = {provider: data["config"]}
+
         self.tfhelper.write_tfvars(tfvars)
         update_config(self.client, config_key, tfvars)
 
@@ -608,7 +579,7 @@ class AddGenericProviderStep(_BaseExternalProviderStep):
                     "may have an optional path and is used when "
                     "the provider type is set to generic."
                 ),
-            ),
+            )
         )
 
     def _get_preseed_map(self):
@@ -690,9 +661,8 @@ class AddCanonicalProviderStep(_BaseProviderStep):
 
     def run(self, status: Status | None = None) -> Result:
         """Run configure steps."""
-        feature_key = self.feature.SSO_CONFIG_KEY
         try:
-            cfg = read_config(self.client, feature_key)
+            cfg = read_config(self.client, SSO_CONFIG_KEY)
         except ConfigItemNotFoundException:
             cfg = {}
 
@@ -705,7 +675,7 @@ class AddCanonicalProviderStep(_BaseProviderStep):
                 "provider_type": self._provider_type,
                 "provider_proto": self._provider_protocol,
             }
-        update_config(self.client, feature_key, cfg)
+        update_config(self.client, SSO_CONFIG_KEY, cfg)
 
         oauth_offer = cfg[self._provider_name]["config"]["oauth_offer"]
         try:
