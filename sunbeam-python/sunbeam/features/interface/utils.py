@@ -12,13 +12,18 @@ import click
 from sunbeam.lazy import LazyImport
 
 if typing.TYPE_CHECKING:
+    import cryptography.hazmat.backends as backends
     import cryptography.exceptions as crypto_exceptions
+    import cryptography.hazmat.primitives as primitives
     import cryptography.x509 as x509
     import cryptography.x509.oid as x509_oid
 else:
+    backends = LazyImport("cryptography.hazmat.backends")
     crypto_exceptions = LazyImport("cryptography.exceptions")
+    primitives = LazyImport("cryptography.hazmat.primitives")
     x509 = LazyImport("cryptography.x509")
     x509_oid = LazyImport("cryptography.x509.oid")
+    
 
 LOG = logging.getLogger()
 
@@ -156,3 +161,14 @@ def decode_base64_as_string(data: str) -> str | None:
     except (binascii.Error, TypeError) as e:
         LOG.debug(f"Error in decoding data {data} : {str(e)}")
         return None
+
+
+def cert_and_key_match(certificate: bytes, key: bytes) -> bool:
+    """Checks if the supplied cert is derived from the supplied key."""
+    crt = x509.load_pem_x509_certificate(certificate, backends.default_backend())
+    cert_pub_key = crt.public_key()
+    private_key = primitives.serialization.load_pem_private_key(
+        key, password=None, backend=backends.default_backend()
+    )
+    private_public_key = private_key.public_key()
+    return cert_pub_key.public_numbers() == private_public_key.public_numbers()

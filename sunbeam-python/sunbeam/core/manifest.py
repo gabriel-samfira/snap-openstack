@@ -215,12 +215,18 @@ class CoreConfig(pydantic.BaseModel):
             return v
 
     class _Identity(pydantic.BaseModel):
+
+        class _IdentitySAML2KeyAndCert(pydantic.BaseModel):
+            certificate: str
+            key: str
+
         class _IdentityProfile(pydantic.BaseModel):
             provider: str
             protocol: str
             config: dict[str, str]
 
         profiles: dict[str, _IdentityProfile]
+        saml2_x509: _IdentitySAML2KeyAndCert
 
     class _PCI(pydantic.BaseModel):
         # Source: https://docs.openstack.org/nova/latest/configuration/config.html#pci.device_spec

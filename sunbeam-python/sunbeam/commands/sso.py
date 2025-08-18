@@ -3,6 +3,7 @@
 
 import click
 import yaml
+import os
 from rich.console import Console
 from rich.table import Table
 
@@ -20,11 +21,17 @@ from sunbeam.core.deployment import Deployment
 from sunbeam.core.juju import (
     ActionFailedException,
     JujuHelper,
+    JujuSecretNotFound,
     LeaderNotFoundException,
+    JujuWaitException,
 )
 from sunbeam.core.openstack import OPENSTACK_MODEL
-from sunbeam.core.terraform import TerraformInitStep
+from sunbeam.core.terraform import TerraformInitStep, TerraformException
+from sunbeam.core.checks import VerifyBootstrappedCheck, run_preflight_checks
 from sunbeam.steps.juju import RemoveSaasApplicationsStep
+from sunbeam.features.interface.utils import (
+    cert_and_key_match
+)
 from sunbeam.steps.sso import (
     APPLICATION_REMOVE_TIMEOUT,
     SSO_CONFIG_KEY,
@@ -37,8 +44,11 @@ from sunbeam.steps.sso import (
     UpdateExternalProviderStep,
 )
 from sunbeam.utils import click_option_show_hints
+from sunbeam.steps.openstack import CONFIG_KEY
+
 
 console = Console()
+_SAML2_CERT_KEY_SECRET = "keystone-saml2-x509-key-cert"
 
 
 @click.command(name="list")
@@ -130,7 +140,13 @@ def add_sso(
 ) -> None:
     """Add a new identity provider."""
     deployment: Deployment = ctx.obj
+
     client = deployment.get_client()
+    preflight_checks = [
+        VerifyBootstrappedCheck(client)
+    ]
+    run_preflight_checks(preflight_checks, console)
+
     try:
         cfg = read_config(client, SSO_CONFIG_KEY)
     except ConfigItemNotFoundException:
@@ -190,6 +206,10 @@ def remove_sso(ctx: click.Context, name: str, yes_i_mean_it: bool, show_hints: b
     """Remove an identity provider."""
     deployment: Deployment = ctx.obj
     client = deployment.get_client()
+    preflight_checks = [
+        VerifyBootstrappedCheck(client)
+    ]
+    run_preflight_checks(preflight_checks, console)
     try:
         cfg = read_config(client, SSO_CONFIG_KEY)
     except ConfigItemNotFoundException:
@@ -249,6 +269,10 @@ def update_sso(ctx: click.Context, name: str, secrets_file: str, show_hints: boo
     """Update identity provider."""
     deployment: Deployment = ctx.obj
     client = deployment.get_client()
+    preflight_checks = [
+        VerifyBootstrappedCheck(client)
+    ]
+    run_preflight_checks(preflight_checks, console)
     try:
         cfg = read_config(client, SSO_CONFIG_KEY)
     except ConfigItemNotFoundException:
@@ -323,6 +347,10 @@ def purge_sso(
     deployment: Deployment = ctx.obj
     jhelper = JujuHelper(deployment.juju_controller)
     client = deployment.get_client()
+    preflight_checks = [
+        VerifyBootstrappedCheck(client)
+    ]
+    run_preflight_checks(preflight_checks, console)
     try:
         config = read_config(client, SSO_CONFIG_KEY)
     except ConfigItemNotFoundException:
@@ -365,3 +393,116 @@ def purge_sso(
         )
     run_plan(remove_idp_plan, console, show_hints)
     update_config(client, SSO_CONFIG_KEY, {})
+
+
+@click.command(name="purge")
+@click_option_show_hints
+@click.option(
+    "--certificate",
+    type=str,
+    required=True,
+    help="Path to x509 certificate file.",
+)
+@click.option(
+    "--key",
+    type=str,
+    required=True,
+    help="Path to key file.",
+)
+@click.pass_context
+def set_saml_x509(
+    ctx: click.Context,
+    show_hints: bool,
+    certificate: str,
+    key: str,
+) -> None:
+    deployment: Deployment = ctx.obj
+    jhelper = JujuHelper(deployment.juju_controller)
+    client = deployment.get_client()
+    tfhelper = deployment.get_tfhelper("openstack-plan")
+    preflight_checks = [
+        VerifyBootstrappedCheck(client)
+    ]
+    run_preflight_checks(preflight_checks, console)
+
+    if not os.path.isfile(certificate):
+        raise click.ClickException(f"Could not open {certificate}")
+    if not os.path.isfile(key):
+        raise click.ClickException(f"Could not open {key}")
+
+    try:
+        cert_data = open(certificate).read()
+        key_data = open(key).read()
+    except Exception as e:
+        raise click.ClickException(f"Could not read certificate or key {e}")
+
+    if not cert_and_key_match(cert_data.encode(), key_data.encode()):
+        raise click.ClickException(
+            f"Certificate {certificate} is not derived from {key}"
+        )
+
+    try:
+        k_secret = jhelper.get_secret_by_name(
+            OPENSTACK_MODEL,
+            _SAML2_CERT_KEY_SECRET,
+        )
+    except JujuSecretNotFound:
+        secret_id = jhelper.add_secret(
+            model=OPENSTACK_MODEL,
+            name=_SAML2_CERT_KEY_SECRET,
+            data={
+                "certificate#file": certificate,
+                "key#file": key,
+            }
+        )
+        k_secret = jhelper.get_secret(
+            OPENSTACK_MODEL,
+            secret_id,
+        )
+    except Exception as e:
+        raise click.ClickException(
+            f"Failed to get secret {_SAML2_CERT_KEY_SECRET}"
+        )
+    
+    k_cert = k_secret.get("certificate", None)
+    k_key = k_secret.get("key", None)
+    if cert_data != k_cert or key_data != k_key:
+        jhelper.update_secret(
+            model=OPENSTACK_MODEL,
+            name=_SAML2_CERT_KEY_SECRET,
+            data={
+                "certificate#file": certificate,
+                "key#file": key,
+            }
+        )
+
+    # Grant secret access to the vault application
+    jhelper.grant_secret(
+        OPENSTACK_MODEL, _SAML2_CERT_KEY_SECRET, "keystone"
+    )
+
+    try:
+        tfvars = read_config(client, CONFIG_KEY)
+    except ConfigItemNotFoundException:
+        tfvars = {}
+
+    if tfvars.get("keystone-config"):
+        tfvars["keystone-config"]["saml-x509-keypair"] = _SAML2_CERT_KEY_SECRET
+    else:
+        tfvars["keystone-config"] = {
+            "saml-x509-keypair": _SAML2_CERT_KEY_SECRET,
+        }
+    tfhelper.write_tfvars(tfvars)
+    try:
+        tfhelper.apply()
+    except TerraformException as e:
+        raise click.ClickException(f"Failed to apply keystone config {e}")
+
+    try:
+        jhelper.wait_until_active(
+            OPENSTACK_MODEL,
+            ["keystone"],
+            timeout=APPLICATION_REMOVE_TIMEOUT,
+        )
+    except (JujuWaitException, TimeoutError) as e:
+        raise click.ClickException(f"Timed out waiting for keystone: {e}")
