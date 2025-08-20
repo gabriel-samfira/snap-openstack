@@ -125,6 +125,7 @@ def main():
     provider_group.add_command(sso_cmd.update_sso)
     provider_group.add_command(sso_cmd.get_openid_redirect_uri)
     provider_group.add_command(sso_cmd.purge_sso)
+    identity_group.add_command(sso_cmd.set_saml_x509)
 
     # Cluster management
     provider_cmds.register_providers()

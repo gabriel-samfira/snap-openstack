@@ -43,6 +43,7 @@ from sunbeam.steps.sso import (
     RemoveExternalProviderStep,
     UpdateExternalProviderStep,
 )
+from sunbeam.features.identity.steps import SetKeystoneSAMLCertAndKeyStep
 from sunbeam.utils import click_option_show_hints
 from sunbeam.steps.openstack import CONFIG_KEY
 
@@ -425,84 +426,17 @@ def set_saml_x509(
     ]
     run_preflight_checks(preflight_checks, console)
 
-    if not os.path.isfile(certificate):
-        raise click.ClickException(f"Could not open {certificate}")
-    if not os.path.isfile(key):
-        raise click.ClickException(f"Could not open {key}")
-
-    try:
-        cert_data = open(certificate).read()
-        key_data = open(key).read()
-    except Exception as e:
-        raise click.ClickException(f"Could not read certificate or key {e}")
-
-    if not cert_and_key_match(cert_data.encode(), key_data.encode()):
-        raise click.ClickException(
-            f"Certificate {certificate} is not derived from {key}"
-        )
-
-    try:
-        k_secret = jhelper.get_secret_by_name(
-            OPENSTACK_MODEL,
-            _SAML2_CERT_KEY_SECRET,
-        )
-    except JujuSecretNotFound:
-        secret_id = jhelper.add_secret(
-            model=OPENSTACK_MODEL,
-            name=_SAML2_CERT_KEY_SECRET,
-            data={
-                "certificate#file": certificate,
-                "key#file": key,
-            }
-        )
-        k_secret = jhelper.get_secret(
-            OPENSTACK_MODEL,
-            secret_id,
-        )
-    except Exception as e:
-        raise click.ClickException(
-            f"Failed to get secret {_SAML2_CERT_KEY_SECRET}"
-        )
-    
-    k_cert = k_secret.get("certificate", None)
-    k_key = k_secret.get("key", None)
-    if cert_data != k_cert or key_data != k_key:
-        jhelper.update_secret(
-            model=OPENSTACK_MODEL,
-            name=_SAML2_CERT_KEY_SECRET,
-            data={
-                "certificate#file": certificate,
-                "key#file": key,
-            }
-        )
-
-    # Grant secret access to the vault application
-    jhelper.grant_secret(
-        OPENSTACK_MODEL, _SAML2_CERT_KEY_SECRET, "keystone"
-    )
-
-    try:
-        tfvars = read_config(client, CONFIG_KEY)
-    except ConfigItemNotFoundException:
-        tfvars = {}
-
-    if tfvars.get("keystone-config"):
-        tfvars["keystone-config"]["saml-x509-keypair"] = _SAML2_CERT_KEY_SECRET
-    else:
-        tfvars["keystone-config"] = {
-            "saml-x509-keypair": _SAML2_CERT_KEY_SECRET,
-        }
-    tfhelper.write_tfvars(tfvars)
-    try:
-        tfhelper.apply()
-    except TerraformException as e:
-        raise click.ClickException(f"Failed to apply keystone config {e}")
-
-    try:
-        jhelper.wait_until_active(
-            OPENSTACK_MODEL,
-            ["keystone"],
-            timeout=APPLICATION_REMOVE_TIMEOUT,
-        )
-    except (JujuWaitException, TimeoutError) as e:
-        raise click.ClickException(f"Timed out waiting for keystone: {e}")
+    run_plan(
+        [
+            TerraformInitStep(deployment.get_tfhelper("openstack-plan")),
+            SetKeystoneSAMLCertAndKeyStep(
+                deployment,
+                tfhelper,
+                jhelper,
+                None,
+                certificate,
+                key,
+            ),
+        ],
+        console,
+        show_hints)
