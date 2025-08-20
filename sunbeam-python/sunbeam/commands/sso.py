@@ -396,7 +396,7 @@ def purge_sso(
     update_config(client, SSO_CONFIG_KEY, {})
 
 
-@click.command(name="purge")
+@click.command(name="set-saml-x509")
 @click_option_show_hints
 @click.option(
     "--certificate",
@@ -417,6 +417,7 @@ def set_saml_x509(
     certificate: str,
     key: str,
 ) -> None:
+    """Set Keystone SAML x509 SP certificate and key."""
     deployment: Deployment = ctx.obj
     jhelper = JujuHelper(deployment.juju_controller)
     client = deployment.get_client()

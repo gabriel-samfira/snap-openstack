@@ -35,6 +35,7 @@ from sunbeam.steps.sso import (
 )
 
 _SAML2_CERT_KEY_SECRET = "keystone-saml2-x509-key-cert"
+_SAML2_CONFIG_KEY = "KeystoneSAML2ConfigKey"
 
 
 class SetKeystoneSAMLCertAndKeyStep(BaseStep, JujuStepHelper):
@@ -66,10 +67,10 @@ class SetKeystoneSAMLCertAndKeyStep(BaseStep, JujuStepHelper):
         :return: ResultType.SKIPPED if the Step should be skipped,
                 ResultType.COMPLETED or ResultType.FAILED otherwise
         """
-        if not self.manifest and not all(self.x509_cert, self.x509_key):
+        if not self.manifest and not all([self.x509_cert, self.x509_key]):
             return Result(ResultType.SKIPPED)
         
-        if all(self.x509_cert, self.x509_key):
+        if all([self.x509_cert, self.x509_key]):
             return Result(ResultType.COMPLETED)
         
         if not self._cert_and_key_from_manifest():
@@ -89,8 +90,10 @@ class SetKeystoneSAMLCertAndKeyStep(BaseStep, JujuStepHelper):
             return {}
 
         has_manifest = all(
-            self.manifest.saml2_x509.certificate,
-            self.manifest.saml2_x509.key,
+            [
+                self.manifest.saml2_x509.certificate,
+                self.manifest.saml2_x509.key,
+            ],
         )
         if not has_manifest:
             return {}
@@ -101,7 +104,7 @@ class SetKeystoneSAMLCertAndKeyStep(BaseStep, JujuStepHelper):
             } 
 
     def _get_cert_and_key_from_params(self) -> Mapping[str, str]:
-        if all(self.x509_cert, self.x509_key):
+        if all([self.x509_cert, self.x509_key]):
             return {
                 "cert": self.x509_cert,
                 "key": self.x509_key,
@@ -129,41 +132,50 @@ class SetKeystoneSAMLCertAndKeyStep(BaseStep, JujuStepHelper):
             )
         
         try:
-            k_secret = self.jhelper.get_secret_by_name(
+            saml2_config = read_config(self.client, _SAML2_CONFIG_KEY)
+        except ConfigItemNotFoundException:
+            saml2_config = {}
+
+        saml_secret_id = saml2_config.get("saml2_cert_key_secret", None)
+
+        if saml_secret_id:
+            k_secret = self.jhelper.get_secret(
                 OPENSTACK_MODEL,
-                _SAML2_CERT_KEY_SECRET,
+                saml_secret_id,
             )
-        except JujuSecretNotFound:
-            secret_id = self.jhelper.add_secret(
+        else:
+            saml_secret_id = self.jhelper.add_secret(
+                info="Keystone SAML SP x509 key",
                 model=OPENSTACK_MODEL,
                 name=_SAML2_CERT_KEY_SECRET,
                 data={
-                    "certificate#file": cert_and_key["cert"],
-                    "key#file": cert_and_key["key"],
+                    "certificate": cert_data,
+                    "key": key_data,
                 }
             )
+            saml2_config["saml2_cert_key_secret"] = saml_secret_id
+            update_config(self.client, _SAML2_CONFIG_KEY, saml2_config)
+
             k_secret = self.jhelper.get_secret(
                 OPENSTACK_MODEL,
-                secret_id,
+                saml_secret_id,
             )
-        except Exception as e:
-            return Result(ResultType.FAILED, str(e))
         
         k_cert = k_secret.get("certificate", None)
         k_key = k_secret.get("key", None)
         if cert_data != k_cert or key_data != k_key:
             self.jhelper.update_secret(
                 model=OPENSTACK_MODEL,
-                name=_SAML2_CERT_KEY_SECRET,
+                name=saml_secret_id,
                 data={
-                    "certificate#file": cert_and_key["cert"],
-                    "key#file": cert_and_key["key"],
+                    "certificate": cert_data,
+                    "key": key_data,
                 }
             )
 
         # Grant secret access to the vault application
         self.jhelper.grant_secret(
-            OPENSTACK_MODEL, _SAML2_CERT_KEY_SECRET, "keystone"
+            OPENSTACK_MODEL, saml_secret_id, "keystone"
         )
 
         try:
@@ -171,12 +183,9 @@ class SetKeystoneSAMLCertAndKeyStep(BaseStep, JujuStepHelper):
         except ConfigItemNotFoundException:
             tfvars = {}
 
-        if tfvars.get("keystone-config"):
-            tfvars["keystone-config"]["saml-x509-keypair"] = _SAML2_CERT_KEY_SECRET
-        else:
-            tfvars["keystone-config"] = {
-                "saml-x509-keypair": _SAML2_CERT_KEY_SECRET,
-            }
+        tfvars["saml-x509-keypair"] = f"secret:{saml_secret_id}"
+
+        update_config(self.client, CONFIG_KEY, tfvars)
         self.tfhelper.write_tfvars(tfvars)
         try:
             self.tfhelper.apply()
