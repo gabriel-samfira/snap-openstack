@@ -35,6 +35,7 @@ from sunbeam.features.interface.utils import (
 from sunbeam.steps.sso import (
     APPLICATION_REMOVE_TIMEOUT,
     SSO_CONFIG_KEY,
+    VALID_SSO_PROTOCOLS,
     AddCanonicalProviderStep,
     AddEntraProviderStep,
     AddGenericProviderStep,
@@ -116,9 +117,7 @@ def list_sso(
 @click.argument(
     "provider-protocol",
     type=click.Choice(
-        [
-            "openid",
-        ],
+        VALID_SSO_PROTOCOLS,
         case_sensitive=False,
     ),
 )
@@ -196,6 +195,13 @@ def add_sso(
 
 @click.command(name="remove")
 @click.argument("name", type=str)
+@click.argument(
+    "protocol",
+    type=click.Choice(
+        VALID_SSO_PROTOCOLS,
+        case_sensitive=False,
+    )
+)
 @click.option(
     "--yes-i-mean-it",
     is_flag=True,
@@ -203,7 +209,13 @@ def add_sso(
 )
 @click_option_show_hints
 @click.pass_context
-def remove_sso(ctx: click.Context, name: str, yes_i_mean_it: bool, show_hints: bool):
+def remove_sso(
+    ctx: click.Context,
+    name: str,
+    protocol: str,
+    yes_i_mean_it: bool,
+    show_hints: bool,
+):
     """Remove an identity provider."""
     deployment: Deployment = ctx.obj
     client = deployment.get_client()
@@ -258,6 +270,13 @@ def remove_sso(ctx: click.Context, name: str, yes_i_mean_it: bool, show_hints: b
 
 @click.command(name="update")
 @click.argument("name", type=str)
+@click.argument(
+    "protocol",
+    type=click.Choice(
+        VALID_SSO_PROTOCOLS,
+        case_sensitive=False,
+    ),
+)
 @click.option(
     "--secrets-file",
     type=str,
@@ -266,7 +285,13 @@ def remove_sso(ctx: click.Context, name: str, yes_i_mean_it: bool, show_hints: b
 )
 @click_option_show_hints
 @click.pass_context
-def update_sso(ctx: click.Context, name: str, secrets_file: str, show_hints: bool):
+def update_sso(
+    ctx: click.Context,
+    name: str,
+    protocol: str,
+    secrets_file: str,
+    show_hints: bool
+):
     """Update identity provider."""
     deployment: Deployment = ctx.obj
     client = deployment.get_client()
@@ -277,10 +302,13 @@ def update_sso(ctx: click.Context, name: str, secrets_file: str, show_hints: boo
     try:
         cfg = read_config(client, SSO_CONFIG_KEY)
     except ConfigItemNotFoundException:
-        cfg = {}
+        cfg = {
+            "openid": {},
+            "saml2": {},
+        }
 
-    if name not in cfg:
-        click.echo(f"{name} does not exist.")
+    if name not in cfg.get(protocol, {}):
+        click.echo(f"{name} with protocol {protocol} does not exist.")
         return
 
     secrets: dict[str, str] = {}
@@ -297,11 +325,12 @@ def update_sso(ctx: click.Context, name: str, secrets_file: str, show_hints: boo
             deployment=deployment,
             jhelper=jhelper,
             provider_name=name,
+            provider_proto=protocol,
             secrets=secrets,
         ),
     ]
     run_plan(plan, console, show_hints)
-    click.echo(f"{name} updated.")
+    click.echo(f"{name} ({protocol}) updated.")
 
 
 @click.command(name="get-oidc-redirect-url")

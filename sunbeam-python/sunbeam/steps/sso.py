@@ -4,7 +4,10 @@
 import copy
 import logging
 import queue
-from typing import Any
+from typing import (
+    Any,
+    Literal,
+)
 
 import click
 import requests
@@ -41,12 +44,12 @@ from sunbeam.steps.openstack import CONFIG_KEY
 LOG = logging.getLogger(__name__)
 _GOOGLE_ISSUER_URL = "https://accounts.google.com"
 _ENTRA_ISSUER_URL = "https://login.microsoftonline.com/%s/v2.0"
-_CONFIG = "FeatureSSOExternalIDPConfig-%s"
+_CONFIG = "FeatureSSOExternalIDPConfig-%(proto)s-%(name)s"
 SSO_CONFIG_KEY = "SSOFeatureConfigKey"
 _OKTA_ISSUER_URL = "https://%s.okta.com"
 APPLICATION_DEPLOY_TIMEOUT = 900  # 15 minutes
 APPLICATION_REMOVE_TIMEOUT = 300  # 5 minutes
-_BASE_QUESTIONS: dict[str, questions.Question] = {
+_BASE_QUESTIONS_OPENID: dict[str, questions.Question] = {
     "client_id": questions.PromptQuestion("OAuth client-id"),
     "client_secret": questions.PasswordPromptQuestion(
         "OAuth client-secret",
@@ -54,14 +57,14 @@ _BASE_QUESTIONS: dict[str, questions.Question] = {
     ),
     "label": questions.PromptQuestion("Label for this provider (optional)"),
 }
-_OKTA_QUESTIONS = _BASE_QUESTIONS | {
+_OKTA_QUESTIONS_OPENID = _BASE_QUESTIONS_OPENID | {
     "okta_org": questions.PromptQuestion("Your Okta org (eg: dev-123456)")
 }
 
-_ENTRA_QUESTIONS = _BASE_QUESTIONS | {
+_ENTRA_QUESTIONS_OPENID = _BASE_QUESTIONS_OPENID | {
     "microsoft_tenant": questions.PromptQuestion("Microsoft tenant ID")
 }
-_GENERIC_PROVIDER_QUESTIONS = _BASE_QUESTIONS | {
+_GENERIC_PROVIDER_QUESTIONS_OPENID = _BASE_QUESTIONS_OPENID | {
     "issuer_url": questions.PromptQuestion(
         "OpenID Issuer URL",
         description=(
@@ -71,6 +74,52 @@ _GENERIC_PROVIDER_QUESTIONS = _BASE_QUESTIONS | {
             "the provider type is set to generic."
         ),
     )
+}
+
+_BASE_QUESTIONS_SAML2: dict[str, questions.Question] = {
+    "app_id": questions.PromptQuestion(
+        "SAML2 application ID",
+        description=(
+            "The SAML2 application ID you want to enable for this"
+            "provider. You should be able to find it in the dashboard"
+            "of your IDP."
+        ),
+    ),
+    "label": questions.PromptQuestion("Label for this provider (optional)"),
+}
+_ENTRA_QUESTIONS_SAML2 = _BASE_QUESTIONS_SAML2 | {
+    "microsoft_tenant": questions.PromptQuestion("Microsoft tenant ID")
+}
+_OKTA_QUESTIONS_SAML2 = _BASE_QUESTIONS_SAML2 | {
+    "okta_org": questions.PromptQuestion("Your Okta org (eg: dev-123456)")
+}
+_GENERIC_PROVIDER_QUESTIONS_SAML2 = dict[str, questions.Question] = {
+    "metadata_url": questions.PromptQuestion("SAML2 metadata URL"),
+    "ca_chain": questions.PromptQuestion(
+        "CA certificate chain",
+        description=(
+            "The CA certificate chain used to validate this generic SAML2"
+            "provider. This needs to be the path to the PEM encoded CA chain."
+        ),
+    ),
+    "label": questions.PromptQuestion("Label for this provider (optional)"),
+}
+
+_QUESTIONS = {
+    "openid": {
+        "base": _BASE_QUESTIONS_OPENID,
+        "google": _BASE_QUESTIONS_OPENID,
+        "entra": _ENTRA_QUESTIONS_OPENID,
+        "okta": _OKTA_QUESTIONS_OPENID,
+        "generic": _GENERIC_PROVIDER_QUESTIONS_OPENID,
+    },
+    "saml2": {
+        "base": _BASE_QUESTIONS_SAML2,
+        "google": _BASE_QUESTIONS_SAML2,
+        "entra": _ENTRA_QUESTIONS_SAML2,
+        "okta": _OKTA_QUESTIONS_SAML2,
+        "generic": _GENERIC_PROVIDER_QUESTIONS_SAML2,
+    }
 }
 
 _CANONICAL_IAM_QUESTIONS: dict[str, questions.Question] = {
@@ -97,47 +146,106 @@ _CANONICAL_IAM_QUESTIONS: dict[str, questions.Question] = {
         ),
     ),
 }
+VALID_SSO_PROTOCOLS = [
+    "openid",
+    "saml2",
+]
 
 console = Console()
 
 
-class _OIDCValidationMixin:
-    def _validate_oidc_config(self, name: str, idp: dict) -> None:
-        """Basic check for openid connect discovery document."""
-        issuer_url = idp.get("config", {}).get("issuer_url", None)
-        if not issuer_url:
-            raise ValueError(
-                f"could not find issuer_url for {name}",
-            )
+def _safe_get_sso_config(client: Client):
+    try:
+        cfg = read_config(self.client, SSO_CONFIG_KEY)
+    except ConfigItemNotFoundException:
+        cfg = {
+            "openid": {},
+            "saml2": {},
+        }
 
-        issuer_url = issuer_url.rstrip("/")
-        discovery_ep = f"{issuer_url}/.well-known/openid-configuration"
-        cfg_req = requests.get(discovery_ep, timeout=10)
-        cfg_req.raise_for_status()
-        data = cfg_req.json()
+    if not cfg.get("openid"):
+        cfg["openid"] = {}
+    if not cfg.get("saml2"):
+        cfg["saml2"] = {}
+    return cfg
 
-        # see: https://openid.net/specs/openid-connect-discovery-1_0.html
-        mandatory_openid_fields = [
-            "issuer",
-            "authorization_endpoint",
-            "token_endpoint",
-            "jwks_uri",
-            "response_types_supported",
-            "subject_types_supported",
-            "id_token_signing_alg_values_supported",
-        ]
-        missing = []
-        for required in mandatory_openid_fields:
-            if required not in data:
-                missing.append(required)
 
-        if missing:
-            raise ValueError(
-                (
-                    f"Missing required fields in OIDC discovery document: "
-                    f"{', '.join(missing)}"
-                ),
-            )
+def _safe_get_tfvars(client: Client):
+    try:
+        tfvars = read_config(client, CONFIG_KEY)
+    except ConfigItemNotFoundException:
+        tfvars = {
+            "sso-providers": {
+                "openid": {},
+                "saml2": {},
+            },
+        }
+    if not tfvars.get("sso-providers"):
+        tfvars["sso-providers"] = {
+            "openid": {},
+            "saml2": {},
+        }
+    else:
+        if not tfvars["sso-providers"].get("openid"):
+            tfvars["sso-providers"]["openid"] = {}
+        if not tfvars["sso-providers"].get("saml2"):
+            tfvars["sso-providers"]["saml2"] = {}
+    return tfvars
+
+def _validate_oidc_config(name: str, idp: dict) -> None:
+    """Basic check for openid connect discovery document."""
+    issuer_url = idp.get("config", {}).get("issuer_url", None)
+    if not issuer_url:
+        raise ValueError(
+            f"could not find issuer_url for {name}",
+        )
+
+    issuer_url = issuer_url.rstrip("/")
+    discovery_ep = f"{issuer_url}/.well-known/openid-configuration"
+    cfg_req = requests.get(discovery_ep, timeout=10)
+    cfg_req.raise_for_status()
+    data = cfg_req.json()
+
+    # see: https://openid.net/specs/openid-connect-discovery-1_0.html
+    mandatory_openid_fields = [
+        "issuer",
+        "authorization_endpoint",
+        "token_endpoint",
+        "jwks_uri",
+        "response_types_supported",
+        "subject_types_supported",
+        "id_token_signing_alg_values_supported",
+    ]
+    missing = []
+    for required in mandatory_openid_fields:
+        if required not in data:
+            missing.append(required)
+
+    if missing:
+        raise ValueError(
+            (
+                f"Missing required fields in OIDC discovery document: "
+                f"{', '.join(missing)}"
+            ),
+        )
+
+
+def _validate_saml2_config(name: str, idp: dict) -> None:
+    # TODO: finish this
+    return None
+
+
+def _validate_idp(protocol: str, name: str, idp: dict) -> None:
+    validator_map = {
+        "openid": _validate_oidc_config,
+        "saml2": _validate_saml2_config,
+    }
+    validate_fn = validator_map.get(protocol, None)
+    if not validate_fn:
+        raise click.ClickException(
+            f"Cannot validate protocol {protocol}"
+        )
+    validate_fn(name, idp)
 
 
 class RemoveExternalProviderStep(BaseStep, JujuStepHelper):
@@ -145,7 +253,8 @@ class RemoveExternalProviderStep(BaseStep, JujuStepHelper):
         self,
         deployment: Deployment,
         jhelper: JujuHelper,
-        provider_name,
+        provider_name: str,
+        provider_proto: str,
     ):
         super().__init__(
             "Remove external IDP",
@@ -156,27 +265,32 @@ class RemoveExternalProviderStep(BaseStep, JujuStepHelper):
         self.deployment = deployment
         self.tfhelper = deployment.get_tfhelper("openstack-plan")
         self._provider_name = provider_name
+        if provider_proto not in VALID_SSO_PROTOCOLS:
+            raise ValueError(f"Invalid protocol {provider_proto}")
+        self._proto = provider_proto
 
     def run(self, status: Status | None = None) -> Result:
         """Apply terraform configuration to deploy openstack application."""
-        try:
-            tfvars = read_config(self.client, CONFIG_KEY)
-        except ConfigItemNotFoundException:
-            tfvars = {}
+        tfvars = _safe_get_tfvars(self.client)
+        cfg = _safe_get_sso_config(self.client)
 
-        try:
-            cfg = read_config(self.client, SSO_CONFIG_KEY)
-        except ConfigItemNotFoundException:
-            cfg = {}
-
-        if self._provider_name in tfvars.get("sso-providers", {}):
-            del tfvars["sso-providers"][self._provider_name]
+        if self._provider_name in tfvars["sso-providers"][self._proto]:
+            del tfvars["sso-providers"][self._proto][self._provider_name]
             self.tfhelper.write_tfvars(tfvars)
             update_config(self.client, CONFIG_KEY, tfvars)
 
-        if self._provider_name in cfg:
-            del cfg[self._provider_name]
-            update_config(self.client, SSO_CONFIG_KEY, cfg)
+        cfg_provider = cfg.get(self._provider_name, {})
+        if not cfg_provider:
+            return Result(ResultType.COMPLETED)
+
+        cfg_proto = cfg[self._provider_name].get(self._proto, {})
+        if cfg_proto:
+            cfg[self._provider_name].pop(self._proto, None)
+        
+        if not cfg[self._provider_name]:
+            cfg.pop(self._provider_name, None)
+
+        update_config(self.client, SSO_CONFIG_KEY, cfg)
 
         try:
             self.tfhelper.apply()
@@ -185,7 +299,7 @@ class RemoveExternalProviderStep(BaseStep, JujuStepHelper):
 
         try:
             self.jhelper.wait_application_gone(
-                [f"keystone-idp-{self._provider_name}"],
+                [f"keystone-idp-{self._proto}-{self._provider_name}"],
                 OPENSTACK_MODEL,
                 timeout=APPLICATION_REMOVE_TIMEOUT,
             )
@@ -200,7 +314,10 @@ class RemoveExternalProviderStep(BaseStep, JujuStepHelper):
         # Clear answers on delete.
         questions.write_answers(
             self.client,
-            _CONFIG % self._provider_name,
+            _CONFIG % {
+                "name": self._provider_name,
+                "proto": self._protom
+            },
             {},
         )
         return Result(ResultType.COMPLETED)
@@ -211,7 +328,8 @@ class UpdateExternalProviderStep(BaseStep, JujuStepHelper):
         self,
         deployment: Deployment,
         jhelper: JujuHelper,
-        provider_name,
+        provider_name: str,
+        provider_proto: str,
         secrets: dict[str, str],
     ):
         super().__init__(
@@ -223,9 +341,34 @@ class UpdateExternalProviderStep(BaseStep, JujuStepHelper):
         self.deployment = deployment
         self.tfhelper = deployment.get_tfhelper("openstack-plan")
         self._provider_name = provider_name
+        self._proto = provider_proto
+        if provider_proto not in VALID_SSO_PROTOCOLS:
+            raise ValueError(f"Invalid protocol {provider_proto}")
         self._secrets = self._validate_secrets(secrets)
 
-    def _validate_secrets(self, data: dict[str, str]):
+    def _update_openid(self, cfg, tfvars):
+        cfg[self._proto][self._provider_name][
+            "config"]["client_id"] = self._secrets["client_id"]
+        cfg[self._proto][self._provider_name][
+            "config"]["client_secret"] = self._secrets["client_secret"]
+        update_config(self.client, SSO_CONFIG_KEY, cfg)
+
+        if tfvars.get("sso-providers"):
+            tfvars["sso-providers"][self._provider_name] = cfg[self._provider_name][
+                "config"
+            ]
+        else:
+            tfvars["sso-providers"] = {
+                self._provider_name: cfg[self._provider_name]["config"]
+            }
+
+        return (cfg, tfvars)
+
+    def _update_saml2(self, cfg, tfvars):
+        # No secrets to update for SAML2.
+        (cfg, tfvars)
+
+    def _validate_secrets_openid(self, data: dict[str, str]):
         if not data:
             raise click.ClickException(
                 "Invalid config supplied. Config must contain key/value pairs"
@@ -249,51 +392,55 @@ class UpdateExternalProviderStep(BaseStep, JujuStepHelper):
             required_configs[key] = val
         return required_configs
 
+    def _validate_secrets_saml2(self, data: dict[str, str]):
+        # SAML2 has no secrets.
+        return {}
+
+    def _validate_secrets(self, data: dict[str, str]):
+        validate_fn = getattr(self, f"_validate_secrets_{self._proto}", None)
+        if not validate_fn:
+            raise click.ClickException(
+                f"No validation can be done for protocol {self._proto}"
+            )
+        return validate_fn(data)
+
     def run(self, status: Status | None = None) -> Result:
         """Apply terraform configuration to deploy openstack application."""
-        try:
-            tfvars = read_config(self.client, CONFIG_KEY)
-        except ConfigItemNotFoundException:
-            tfvars = {}
+        tfvars = _safe_get_tfvars(self.client)
+        cfg = _safe_get_sso_config(self.client)
 
-        try:
-            cfg = read_config(self.client, SSO_CONFIG_KEY)
-        except ConfigItemNotFoundException:
-            cfg = {}
+        if self._provider_name not in cfg[self._proto]:
+            return Result(
+                ResultType.FAILED,
+                f"Provider {self._provider_name} ({self._proto}) not found")
 
-        if self._provider_name not in cfg:
-            return Result(ResultType.FAILED, "Provider not found")
-
-        provider_type = cfg[self._provider_name].get("provider_type", None)
+        provider_type = cfg[self._proto][self._provider_name].get(
+            "provider_type", None,
+        )
         if not provider_type or provider_type == "canonical":
             return Result(
                 ResultType.FAILED,
                 (
-                    f"Provider {self._provider_name} of type "
-                    "{provider_type} cannot be updated"
+                    f"Provider {self._provider_name} ({self._proto})"
+                    "cannot be updated"
                 ),
             )
 
-        if "config" not in cfg[self._provider_name]:
+        if "config" not in cfg[self._proto][self._provider_name]:
             return Result(
                 ResultType.FAILED,
-                f"Provider {self._provider_name} is in an invalid state",
+                f"Provider {self._provider_name} ({self._proto})"
+                " is in an invalid state",
             )
 
-        cfg[self._provider_name]["config"]["client_id"] = self._secrets["client_id"]
-        cfg[self._provider_name]["config"]["client_secret"] = self._secrets[
-            "client_secret"
-        ]
-        update_config(self.client, SSO_CONFIG_KEY, cfg)
+        update_fn = getattr(self, f"_update_{self._proto}", None)
+        if not fn:
+            return Result(
+                ResultType.FAILED,
+                f"No update possible for protocol {self._proto}"
+            )
+        cfg, tfvars = update_fn(cfg, tfvars)
 
-        if tfvars.get("sso-providers"):
-            tfvars["sso-providers"][self._provider_name] = cfg[self._provider_name][
-                "config"
-            ]
-        else:
-            tfvars["sso-providers"] = {
-                self._provider_name: cfg[self._provider_name]["config"]
-            }
         self.tfhelper.write_tfvars(tfvars)
         update_config(self.client, CONFIG_KEY, tfvars)
         try:
@@ -301,7 +448,7 @@ class UpdateExternalProviderStep(BaseStep, JujuStepHelper):
         except TerraformException as e:
             return Result(ResultType.FAILED, str(e))
 
-        charm_name = "keystone-idp-{}".format(self._provider_name)
+        charm_name = f"keystone-idp-{self._proto}-{self._provider_name}"
         apps = ["keystone", "horizon", charm_name]
         app_queue: queue.Queue[str] = queue.Queue()
         task = update_status_background(self, apps, app_queue, status)
@@ -340,7 +487,7 @@ class _BaseProviderStep(BaseStep, JujuStepHelper):
 
         self._provider_name = provider_name
         self._provider_type = provider_type
-        self._provider_protocol = provider_protocol
+        self._proto = provider_protocol
         self._questions: dict[str, questions.Question] = {}
         self._preseed = self._compose_preseed_from_config(charm_config)
 
@@ -395,9 +542,13 @@ class _BaseProviderStep(BaseStep, JujuStepHelper):
         :param console: the console to prompt on
         :type console: rich.console.Console (Optional)
         """
+        asnwer_key = _CONFIG % {
+            "name": self._provider_name,
+            "proto": self._proto,
+        }
         variables = questions.load_answers(
             self.client,
-            _CONFIG % self._provider_name,
+            asnwer_key,
         )
         sso_bank = questions.QuestionBank(
             questions=self._questions,
@@ -407,97 +558,129 @@ class _BaseProviderStep(BaseStep, JujuStepHelper):
             show_hint=show_hint,
         )
         variables = self._ask(sso_bank, variables)
-        questions.write_answers(self.client, _CONFIG % self._provider_name, variables)
+        questions.write_answers(self.client, asnwer_key, variables)
 
 
-class _BaseExternalProviderStep(_BaseProviderStep, _OIDCValidationMixin):
+class _BaseExternalProviderStep(_BaseProviderStep):
     def __init__(self, *args):
         super().__init__(*args)
-        self._issuer_url = None
-        self._client_id = None
-        self._client_secret = None
-        self._label = None
-        self._questions = copy.deepcopy(_BASE_QUESTIONS)
-
-    def _get_preseed_map(self):
-        return {
+        self._openid_config = {
+            "issuer_url": None,
             "client_id": None,
             "client_secret": None,
             "label": None,
+            "name": self._provider_name,
+            "provider": "generic",
+        }
+        self._saml2_config = {
+            "metadata-url": None,
+            "label": None,
+            "name": self._provider_name,
+        }
+        # dicts are passed by reference.
+        self._config_map = {
+            "openid": self._openid_config,
+            "saml2": self._saml2_config,
         }
 
-    def _ask(self, q_bank: questions.QuestionBank, variables: dict):
-        self._client_id = q_bank.client_id.ask()
-        self._client_secret = q_bank.client_secret.ask()
-        self._label = q_bank.label.ask()
+        self._issuer_url = None
+        self._saml2_app_id = None
+        self._questions = copy.deepcopy(_QUESTIONS[self._proto]["base"])
 
-        if not all([self._client_id, self._client_secret]):
+    def _get_preseed_map(self):
+        preseed_map = {
+            "openid": {
+                "client_id": None,
+                "client_secret": None,
+                "label": None,
+            },
+            "saml2": {
+                "label": None,
+                "app_id": None,
+            },
+        }
+        return preseed_map.get(self._proto, {})
+
+    def _ask_openid(self, q_bank: questions.QuestionBank, variables: dict):
+        self._openid_config["client_id"] = q_bank.client_id.ask()
+        self._openid_config["client_secret"] = q_bank.client_secret.ask()
+        self._openid_config["label"] = q_bank.label.ask()
+
+        required = [
+            self._openid_config["client_id"],
+            self._openid_config["client_secret"],
+        ]
+        if not all(required):
             raise click.ClickException("client_id and client_secret are mandatory")
 
-        if not self._label:
+        if not self._openid_config["label"]:
             label_name = self._provider_name.capitalize()
-            self._label = f"Log in with {label_name}"
+            self._openid_config["label"] = f"Log in with {label_name}"
 
-        variables["label"] = self._label
-        variables["client_id"] = self._client_id
-        variables["client_secret"] = self._client_secret
+        variables["label"] = self._openid_config["label"]
+        variables["client_id"] = self._openid_config["client_id"]
+        variables["client_secret"] = self._openid_config["client_secret"]
         return variables
+    
+    def _ask_saml2(self, q_bank: questions.QuestionBank, variables: dict):
+        self._saml2_config["label"] = q_bank.label.ask()
+        if not self._saml2_config["label"]:
+            label_name = self._provider_name.capitalize()
+            self._saml2_config["label"] = f"Log in with {label_name}"
+
+        self._saml2_app_id = q_bank.app_id.ask()
+        if not self._saml2_app_id:
+            raise click.ClickException("app_id is mandatory")
+
+        variables["app_id"] = self._saml2_app_id
+        variables["label"] = self._saml2_config["label"]
+        return variables
+
+    def _ask(self, q_bank: questions.QuestionBank, variables: dict):
+        ask_fn = getattr(self, f"_ask_{self._proto}", None)
+        if not ask_fn:
+            raise click.ClickException(f"invalid protocol {self._proto}")
+        return ask_fn(q_bank, variables)
 
     @property
     def _charm_config(self):
-        if not all(
-            [
-                self._issuer_url,
-                self._client_id,
-                self._client_secret,
-                self._label,
-                self._provider_name,
-            ]
-        ):
+        cfg = self._config_map.get(self._proto, {})
+        if not cfg:
+            raise click.ClickException(
+                f"No config possible for protocol {self._proto}")
+
+        if not all(cfg.values()):
             raise click.ClickException("invalid state for provider step")
-        return {
-            "provider": "generic",
-            "provider_id": self._provider_name,
-            "client_id": self._client_id,
-            "client_secret": self._client_secret,
-            "label": self._label,
-            "issuer_url": self._issuer_url,
-        }
+        return cfg
 
     def run(self, status: Status | None = None) -> Result:
-        try:
-            tfvars = read_config(self.client, CONFIG_KEY)
-        except ConfigItemNotFoundException:
-            tfvars = {}
+        tfvars = _safe_get_tfvars(self.client)
+        cfg = _safe_get_sso_config(self.client)
 
-        try:
-            cfg = read_config(self.client, SSO_CONFIG_KEY)
-        except ConfigItemNotFoundException:
-            cfg = {}
-
-        idp = cfg.get(self._provider_name)
+        idp = cfg[self._proto].get(self._provider_name)
         if idp:
-            cfg[self._provider_name]["config"] = self._charm_config
+            cfg[self._proto][self._provider_name][
+                "config"] = self._charm_config
         else:
-            cfg[self._provider_name] = {
+            cfg[self._proto][self._provider_name] = {
                 "config": self._charm_config,
                 "provider_type": self._provider_type,
-                "provider_proto": self._provider_protocol,
             }
         update_config(self.client, SSO_CONFIG_KEY, cfg)
 
         try:
-            self._validate_oidc_config(self._provider_name, cfg[self._provider_name])
+            _validate_idp(
+                self._proto,
+                self._provider_name,
+                cfg[self._provider_name],
+            )
         except Exception as e:
             return Result(ResultType.FAILED, str(e))
 
         for provider, data in cfg.items():
             if data.get("provider_type", None) == "canonical":
                 continue
-            if tfvars.get("sso-providers"):
-                tfvars["sso-providers"][provider] = data["config"]
-            else:
-                tfvars["sso-providers"] = {provider: data["config"]}
+            tfvars["sso-providers"][self._proto][provider] = data["config"]
 
         self.tfhelper.write_tfvars(tfvars)
         update_config(self.client, CONFIG_KEY, tfvars)
@@ -507,7 +690,7 @@ class _BaseExternalProviderStep(_BaseProviderStep, _OIDCValidationMixin):
         except TerraformException as e:
             return Result(ResultType.FAILED, str(e))
 
-        charm_name = f"keystone-idp-{self._provider_name}"
+        charm_name = f"keystone-idp-{self._proto}-{self._provider_name}"
         apps = ["keystone", "horizon", charm_name]
         app_queue: queue.Queue[str] = queue.Queue()
         task = update_status_background(self, apps, app_queue, status)
@@ -535,6 +718,8 @@ class AddGoogleProviderStep(_BaseExternalProviderStep):
             *args,
             **kw,
         )
+        self._questions = copy.deepcopy(
+            _QUESTIONS[self._proto]["google"])
         self._issuer_url = _GOOGLE_ISSUER_URL
 
 
@@ -547,7 +732,8 @@ class AddOktaProviderStep(_BaseExternalProviderStep):
             *args,
             **kw,
         )
-        self._questions = copy.deepcopy(_OKTA_QUESTIONS)
+        self._questions = copy.deepcopy(
+            _QUESTIONS[self._proto]["okta"])
 
     def _get_preseed_map(self):
         preseed = super()._get_preseed_map()
@@ -573,7 +759,8 @@ class AddEntraProviderStep(_BaseExternalProviderStep):
             *args,
             **kw,
         )
-        self._questions = copy.deepcopy(_ENTRA_QUESTIONS)
+        self._questions = copy.deepcopy(
+            _QUESTIONS[self._proto]["entra"])
 
     def _get_preseed_map(self):
         preseed = super()._get_preseed_map()
@@ -599,7 +786,8 @@ class AddGenericProviderStep(_BaseExternalProviderStep):
             *args,
             **kw,
         )
-        self._questions = copy.deepcopy(_GENERIC_PROVIDER_QUESTIONS)
+        self._questions = copy.deepcopy(
+            _QUESTIONS[self._proto]["generic"])
 
     def _get_preseed_map(self):
         preseed = super()._get_preseed_map()
@@ -657,10 +845,7 @@ class AddCanonicalProviderStep(_BaseProviderStep):
 
     def run(self, status: Status | None = None) -> Result:
         """Run configure steps."""
-        try:
-            cfg = read_config(self.client, SSO_CONFIG_KEY)
-        except ConfigItemNotFoundException:
-            cfg = {}
+        cfg = _safe_get_sso_config(self.client)
 
         idp = cfg.get(self._provider_name)
         if idp:
@@ -669,7 +854,7 @@ class AddCanonicalProviderStep(_BaseProviderStep):
             cfg[self._provider_name] = {
                 "config": self._charm_config,
                 "provider_type": self._provider_type,
-                "provider_proto": self._provider_protocol,
+                "provider_proto": self._proto,
             }
         update_config(self.client, SSO_CONFIG_KEY, cfg)
 
@@ -708,12 +893,12 @@ class AddCanonicalProviderStep(_BaseProviderStep):
         return Result(ResultType.COMPLETED)
 
 
-class ValidateIdentityManifest(BaseStep, _OIDCValidationMixin):
+class ValidateIdentityManifest(BaseStep):
     _provider_question_map = {
-        "google": _BASE_QUESTIONS,
-        "okta": _OKTA_QUESTIONS,
-        "entra": _ENTRA_QUESTIONS,
-        "generic": _GENERIC_PROVIDER_QUESTIONS,
+        "google": _BASE_QUESTIONS_OPENID,
+        "okta": _OKTA_QUESTIONS_OPENID,
+        "entra": _ENTRA_QUESTIONS_OPENID,
+        "generic": _GENERIC_PROVIDER_QUESTIONS_OPENID,
     }
 
     def __init__(
@@ -804,7 +989,7 @@ class ValidateIdentityManifest(BaseStep, _OIDCValidationMixin):
             )
 
         parsed_conf = self._charm_config(name, provider, protocol, norm_config)
-        self._validate_oidc_config(name, {"config": parsed_conf})
+        _validate_idp(protocol, name, {"config": parsed_conf})
         return parsed_conf
 
     def has_prompts(self) -> bool:
@@ -835,10 +1020,7 @@ class ValidateIdentityManifest(BaseStep, _OIDCValidationMixin):
         Invoked when the step is run and returns a ResultType to indicate
         :return:
         """
-        try:
-            cfg = read_config(self.client, SSO_CONFIG_KEY)
-        except ConfigItemNotFoundException:
-            cfg = {}
+        cfg = _safe_get_sso_config(self.client)
 
         if not self.manifest:
             return Result(ResultType.COMPLETED)
@@ -852,19 +1034,20 @@ class ValidateIdentityManifest(BaseStep, _OIDCValidationMixin):
 
         try:
             for name, config in profiles.items():
-                cfg[name] = {
+                cfg[config.protocol][name] = {
                     "provider_type": config.provider,
-                    "provider_proto": config.protocol,
                 }
                 if config.provider == "canonical":
-                    cfg[name]["config"] = self._canonical_charm_config(
+                    cfg[config.protocol][name][
+                        "config"] = self._canonical_charm_config(
                         name,
                         config.provider,
                         config.protocol,
                         config.config,
                     )
                 else:
-                    cfg[name]["config"] = self._external_charm_config(
+                    cfg[config.protocol][name][
+                        "config"] = self._external_charm_config(
                         name,
                         config.provider,
                         config.protocol,
@@ -932,27 +1115,23 @@ class DeployIdentityProvidersStep(BaseStep, JujuStepHelper):
         Invoked when the step is run and returns a ResultType to indicate
         :return:
         """
-        try:
-            tfvars = read_config(self.client, CONFIG_KEY)
-        except ConfigItemNotFoundException:
-            tfvars = {}
-
-        try:
-            cfg = read_config(self.client, SSO_CONFIG_KEY)
-        except ConfigItemNotFoundException:
-            cfg = {}
+        tfvars = _safe_get_tfvars(self.client)
+        cfg = _safe_get_sso_config(self.client)
 
         apps = ["keystone", "horizon"]
-        canonical_providers = {}
-        for provider, data in cfg.items():
-            if data.get("provider_type", None) == "canonical":
-                canonical_providers[provider] = data
-                continue
-            if tfvars.get("sso-providers"):
-                tfvars["sso-providers"][provider] = data["config"]
-            else:
-                tfvars["sso-providers"] = {provider: data["config"]}
-            apps.append(f"keystone-idp-{provider}")
+        canonical_providers = {
+            "openid": {},
+            # SAML2 is not yet supported by canonical identity platform,
+            # but leaving room for later augmentations.
+            "saml2": {},
+        }
+        for proto, data in cfg.items():
+            for provider, conf in data.items():
+                if conf.get("provider_type", None) == "canonical":
+                    canonical_providers[proto][provider] = conf
+                    continue
+                tfvars["sso-providers"][proto][provider] = conf["config"]
+                apps.append(f"keystone-idp-{proto}-{provider}")
 
         self.tfhelper.write_tfvars(tfvars)
         update_config(self.client, CONFIG_KEY, tfvars)
@@ -976,7 +1155,12 @@ class DeployIdentityProvidersStep(BaseStep, JujuStepHelper):
         finally:
             task.stop()
 
-        for provider, data in canonical_providers.items():
+        # We don't yet know what future SAML2 support will look like
+        # in Canonical Identity Platform. We don't know if we'll have saml
+        # as part of the same offer or a different offer, implemented by
+        # a different charm. We reference "openid" here explicitly for
+        # now.
+        for provider, data in canonical_providers["openid"].items():
             oauth_offer = data["config"]["oauth_offer"]
             try:
                 self.jhelper.consume_offer(
