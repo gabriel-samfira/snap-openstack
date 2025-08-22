@@ -106,7 +106,7 @@ _ENTRA_QUESTIONS_SAML2 = _BASE_QUESTIONS_SAML2 | {
 _OKTA_QUESTIONS_SAML2 = _BASE_QUESTIONS_SAML2 | {
     "okta_org": questions.PromptQuestion("Your Okta org (eg: dev-123456)")
 }
-_GENERIC_PROVIDER_QUESTIONS_SAML2 = dict[str, questions.Question] = {
+_GENERIC_PROVIDER_QUESTIONS_SAML2: dict[str, questions.Question] = {
     "metadata_url": questions.PromptQuestion("SAML2 metadata URL"),
     "ca_chain": questions.PromptQuestion(
         "CA certificate chain",
@@ -305,17 +305,11 @@ class RemoveExternalProviderStep(BaseStep, JujuStepHelper):
             self.tfhelper.write_tfvars(tfvars)
             update_config(self.client, CONFIG_KEY, tfvars)
 
-        cfg_provider = cfg.get(self._provider_name, {})
+        cfg_provider = cfg[self._proto].get(self._provider_name, {})
         if not cfg_provider:
             return Result(ResultType.COMPLETED)
 
-        cfg_proto = cfg[self._provider_name].get(self._proto, {})
-        if cfg_proto:
-            cfg[self._provider_name].pop(self._proto, None)
-        
-        if not cfg[self._provider_name]:
-            cfg.pop(self._provider_name, None)
-
+        cfg[self._proto].pop(self._provider_name, None)
         update_config(self.client, SSO_CONFIG_KEY, cfg)
 
         try:
@@ -342,7 +336,7 @@ class RemoveExternalProviderStep(BaseStep, JujuStepHelper):
             self.client,
             _CONFIG % {
                 "name": self._provider_name,
-                "proto": self._protom
+                "proto": self._proto
             },
             {},
         )
@@ -588,7 +582,7 @@ class _BaseProviderStep(BaseStep, JujuStepHelper):
 
 
 class _BaseExternalProviderStep(_BaseProviderStep):
-    name = "base"
+    idp_name = "base"
 
     def __init__(self, *args):
         super().__init__(*args)
@@ -597,7 +591,7 @@ class _BaseExternalProviderStep(_BaseProviderStep):
             "client_id": None,
             "client_secret": None,
             "label": None,
-            "name": self._provider_name,
+            "provider_id": self._provider_name,
             "provider": "generic",
         }
         self._saml2_config = {
@@ -616,7 +610,7 @@ class _BaseExternalProviderStep(_BaseProviderStep):
         }
 
         self._url_params = {}
-        self._questions = copy.deepcopy(_QUESTIONS[self._proto][self.name])
+        self._questions = copy.deepcopy(_QUESTIONS[self._proto][self.idp_name])
 
     def _get_preseed_map(self):
         preseed_map = {
@@ -635,10 +629,10 @@ class _BaseExternalProviderStep(_BaseProviderStep):
     def _set_idp_metadata_url(self):
         key = self._url_cfg_key_map[self._proto]
         if not self._config_map[self._proto][key]:
-            meta_url = _METADATA_URL_MAP[self._proto].get(self.name)
+            meta_url = _METADATA_URL_MAP[self._proto].get(self.idp_name)
             if not meta_url:
                 raise click.ClickException(
-                    f"cannot compose metadata URL for provider type {self.name}")
+                    f"cannot compose metadata URL for provider type {self.idp_name}")
             self._config_map[self._proto][key] = meta_url % self._url_params
 
     def _ask_openid(self, q_bank: questions.QuestionBank, variables: dict):
@@ -700,7 +694,7 @@ class _BaseExternalProviderStep(_BaseProviderStep):
         tfvars = _safe_get_tfvars(self.client)
         cfg = _safe_get_sso_config(self.client)
 
-        idp = cfg[self._proto].get(self._provider_name)
+        idp = cfg[self._proto].get(self._provider_name, None)
         if idp:
             cfg[self._proto][self._provider_name][
                 "config"] = self._charm_config
@@ -715,15 +709,16 @@ class _BaseExternalProviderStep(_BaseProviderStep):
             _validate_idp(
                 self._proto,
                 self._provider_name,
-                cfg[self._provider_name],
+                cfg[self._proto][self._provider_name],
             )
         except Exception as e:
-            return Result(ResultType.FAILED, str(e))
+            return Result(ResultType.FAILED, f"Failed to validate IDP {e}")
 
-        for provider, data in cfg.items():
-            if data.get("provider_type", None) == "canonical":
-                continue
-            tfvars["sso-providers"][self._proto][provider] = data["config"]
+        for proto, providers in cfg.items():
+            for provider, data in providers.items():
+                if data.get("provider_type", None) == "canonical":
+                    continue
+                tfvars["sso-providers"][proto][provider] = data["config"]
 
         self.tfhelper.write_tfvars(tfvars)
         update_config(self.client, CONFIG_KEY, tfvars)
@@ -731,7 +726,7 @@ class _BaseExternalProviderStep(_BaseProviderStep):
         try:
             self.tfhelper.apply()
         except TerraformException as e:
-            return Result(ResultType.FAILED, str(e))
+            return Result(ResultType.FAILED, f"Failed to apply terraform plan {e}")
 
         charm_name = f"keystone-idp-{self._proto}-{self._provider_name}"
         apps = ["keystone", "horizon", charm_name]
@@ -753,7 +748,7 @@ class _BaseExternalProviderStep(_BaseProviderStep):
 
 
 class AddGoogleProviderStep(_BaseExternalProviderStep):
-    name = "google"
+    idp_name = "google"
 
     def __init__(self, *args, **kw):
         super().__init__(
@@ -766,7 +761,7 @@ class AddGoogleProviderStep(_BaseExternalProviderStep):
 
 
 class AddOktaProviderStep(_BaseExternalProviderStep):
-    name = "okta"
+    idp_name = "okta"
 
     def __init__(self, *args, **kw):
         super().__init__(
@@ -793,7 +788,7 @@ class AddOktaProviderStep(_BaseExternalProviderStep):
 
 
 class AddEntraProviderStep(_BaseExternalProviderStep):
-    name = "entra"
+    idp_name = "entra"
 
     def __init__(self, *args, **kw):
         super().__init__(
@@ -820,7 +815,7 @@ class AddEntraProviderStep(_BaseExternalProviderStep):
 
 
 class AddGenericProviderStep(_BaseExternalProviderStep):
-    name = "generic"
+    idp_name = "generic"
 
     def __init__(self, *args, **kw):
         super().__init__(

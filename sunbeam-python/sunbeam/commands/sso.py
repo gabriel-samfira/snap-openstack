@@ -77,12 +77,14 @@ def list_sso(
         cfg = {}
 
     results = {}
-    for k, v in cfg.items():
-        results[k] = {
-            "type": v.get("provider_type", "unknown"),
-            "protocol": v.get("provider_proto", "unknown"),
-            "issuer_url": v.get("config", {}).get("issuer_url", "unknown"),
-        }
+
+    for proto, providers in cfg.items():
+        for provider, data in providers.items():
+            results[provider] = {
+                "type": data.get("provider_type", "unknown"),
+                "protocol": proto,
+                "issuer_url": data.get("config", {}).get("issuer_url", "unknown"),
+            }
 
     if format == FORMAT_TABLE:
         table = Table()
@@ -228,7 +230,7 @@ def remove_sso(
     except ConfigItemNotFoundException:
         cfg = {}
 
-    provider = cfg.get(name)
+    provider = cfg.get(protocol, {}).get(name)
     if not provider:
         click.echo(f"{name} does not exist.")
         return
@@ -258,6 +260,7 @@ def remove_sso(
                 deployment=deployment,
                 jhelper=jhelper,
                 provider_name=name,
+                provider_proto=protocol,
             )
         )
 
