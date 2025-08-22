@@ -42,11 +42,24 @@ from sunbeam.core.terraform import (
 from sunbeam.steps.openstack import CONFIG_KEY
 
 LOG = logging.getLogger(__name__)
-_GOOGLE_ISSUER_URL = "https://accounts.google.com"
-_ENTRA_ISSUER_URL = "https://login.microsoftonline.com/%s/v2.0"
-_CONFIG = "FeatureSSOExternalIDPConfig-%(proto)s-%(name)s"
 SSO_CONFIG_KEY = "SSOFeatureConfigKey"
-_OKTA_ISSUER_URL = "https://%s.okta.com"
+_CONFIG = "FeatureSSOExternalIDPConfig-%(proto)s-%(name)s"
+
+_GOOGLE_ISSUER_URL = "https://accounts.google.com"
+_ENTRA_ISSUER_URL = "https://login.microsoftonline.com/%(tenant)s/v2.0"
+_OKTA_ISSUER_URL = "https://%(okta_org)s.okta.com"
+
+_GOOGLE_SAML2_METADATA_URL = (
+    "https://accounts.google.com/o/saml2/idp?idpid=%(app_id)s"
+)
+_ENTRA_SAML_METADATA_URL = (
+    "https://login.microsoftonline.com/%(tenant)s/federationmetadata/2007-06"
+    "/federationmetadata.xml?appid=%(app_id)s"
+)
+_OKTA_SAML2_METADATA_URL = (
+    "https://%(okta_org)s/app/%(app_id)s/sso/saml/metadata"
+)
+
 APPLICATION_DEPLOY_TIMEOUT = 900  # 15 minutes
 APPLICATION_REMOVE_TIMEOUT = 300  # 5 minutes
 _BASE_QUESTIONS_OPENID: dict[str, questions.Question] = {
@@ -122,6 +135,19 @@ _QUESTIONS = {
     }
 }
 
+_METADATA_URL_MAP = {
+    "openid": {
+        "google": _GOOGLE_ISSUER_URL,
+        "entra": _ENTRA_ISSUER_URL,
+        "okta": _OKTA_ISSUER_URL,
+    },
+    "saml2": {
+        "google": _GOOGLE_SAML2_METADATA_URL,
+        "entra": _ENTRA_SAML_METADATA_URL,
+        "okta": _OKTA_SAML2_METADATA_URL,
+    },
+}
+
 _CANONICAL_IAM_QUESTIONS: dict[str, questions.Question] = {
     "oauth_offer": questions.PromptQuestion(
         "OAuth juju offer",
@@ -156,7 +182,7 @@ console = Console()
 
 def _safe_get_sso_config(client: Client):
     try:
-        cfg = read_config(self.client, SSO_CONFIG_KEY)
+        cfg = read_config(client, SSO_CONFIG_KEY)
     except ConfigItemNotFoundException:
         cfg = {
             "openid": {},
@@ -434,7 +460,7 @@ class UpdateExternalProviderStep(BaseStep, JujuStepHelper):
             )
 
         update_fn = getattr(self, f"_update_{self._proto}", None)
-        if not fn:
+        if not update_fn:
             return Result(
                 ResultType.FAILED,
                 f"No update possible for protocol {self._proto}"
@@ -562,6 +588,8 @@ class _BaseProviderStep(BaseStep, JujuStepHelper):
 
 
 class _BaseExternalProviderStep(_BaseProviderStep):
+    name = "base"
+
     def __init__(self, *args):
         super().__init__(*args)
         self._openid_config = {
@@ -582,10 +610,13 @@ class _BaseExternalProviderStep(_BaseProviderStep):
             "openid": self._openid_config,
             "saml2": self._saml2_config,
         }
+        self._url_cfg_key_map = {
+            "openid": "issuer_url",
+            "saml2": "metadata-url",
+        }
 
-        self._issuer_url = None
-        self._saml2_app_id = None
-        self._questions = copy.deepcopy(_QUESTIONS[self._proto]["base"])
+        self._url_params = {}
+        self._questions = copy.deepcopy(_QUESTIONS[self._proto][self.name])
 
     def _get_preseed_map(self):
         preseed_map = {
@@ -600,6 +631,15 @@ class _BaseExternalProviderStep(_BaseProviderStep):
             },
         }
         return preseed_map.get(self._proto, {})
+
+    def _set_idp_metadata_url(self):
+        key = self._url_cfg_key_map[self._proto]
+        if not self._config_map[self._proto][key]:
+            meta_url = _METADATA_URL_MAP[self._proto].get(self.name)
+            if not meta_url:
+                raise click.ClickException(
+                    f"cannot compose metadata URL for provider type {self.name}")
+            self._config_map[self._proto][key] = meta_url % self._url_params
 
     def _ask_openid(self, q_bank: questions.QuestionBank, variables: dict):
         self._openid_config["client_id"] = q_bank.client_id.ask()
@@ -628,12 +668,14 @@ class _BaseExternalProviderStep(_BaseProviderStep):
             label_name = self._provider_name.capitalize()
             self._saml2_config["label"] = f"Log in with {label_name}"
 
-        self._saml2_app_id = q_bank.app_id.ask()
-        if not self._saml2_app_id:
+        saml2_app_id = q_bank.app_id.ask()
+        if not saml2_app_id:
             raise click.ClickException("app_id is mandatory")
 
-        variables["app_id"] = self._saml2_app_id
+        variables["app_id"] = saml2_app_id
         variables["label"] = self._saml2_config["label"]
+        self._url_params["app_id"] = saml2_app_id
+
         return variables
 
     def _ask(self, q_bank: questions.QuestionBank, variables: dict):
@@ -644,6 +686,7 @@ class _BaseExternalProviderStep(_BaseProviderStep):
 
     @property
     def _charm_config(self):
+        self._set_idp_metadata_url()
         cfg = self._config_map.get(self._proto, {})
         if not cfg:
             raise click.ClickException(
@@ -710,6 +753,8 @@ class _BaseExternalProviderStep(_BaseProviderStep):
 
 
 class AddGoogleProviderStep(_BaseExternalProviderStep):
+    name = "google"
+
     def __init__(self, *args, **kw):
         super().__init__(
             "Add google external IDP",
@@ -718,12 +763,11 @@ class AddGoogleProviderStep(_BaseExternalProviderStep):
             *args,
             **kw,
         )
-        self._questions = copy.deepcopy(
-            _QUESTIONS[self._proto]["google"])
-        self._issuer_url = _GOOGLE_ISSUER_URL
 
 
 class AddOktaProviderStep(_BaseExternalProviderStep):
+    name = "okta"
+
     def __init__(self, *args, **kw):
         super().__init__(
             "Add okta external IDP",
@@ -732,8 +776,6 @@ class AddOktaProviderStep(_BaseExternalProviderStep):
             *args,
             **kw,
         )
-        self._questions = copy.deepcopy(
-            _QUESTIONS[self._proto]["okta"])
 
     def _get_preseed_map(self):
         preseed = super()._get_preseed_map()
@@ -745,12 +787,14 @@ class AddOktaProviderStep(_BaseExternalProviderStep):
         okta_org = q_bank.okta_org.ask()
         if not okta_org:
             raise click.ClickException("okta_org is mandatory")
-        self._issuer_url = _OKTA_ISSUER_URL % okta_org
+        self._url_params["okta_org"] = okta_org
         variables["okta_org"] = okta_org
         return variables
 
 
 class AddEntraProviderStep(_BaseExternalProviderStep):
+    name = "entra"
+
     def __init__(self, *args, **kw):
         super().__init__(
             "Add entra external IDP",
@@ -759,8 +803,6 @@ class AddEntraProviderStep(_BaseExternalProviderStep):
             *args,
             **kw,
         )
-        self._questions = copy.deepcopy(
-            _QUESTIONS[self._proto]["entra"])
 
     def _get_preseed_map(self):
         preseed = super()._get_preseed_map()
@@ -772,12 +814,14 @@ class AddEntraProviderStep(_BaseExternalProviderStep):
         tenant_id = q_bank.microsoft_tenant.ask()
         if not tenant_id:
             raise click.ClickException("microsoft_tenant is mandatory")
-        self._issuer_url = _ENTRA_ISSUER_URL % tenant_id
+        self._url_params["tenant"] = tenant_id
         variables["microsoft_tenant"] = tenant_id
         return variables
 
 
 class AddGenericProviderStep(_BaseExternalProviderStep):
+    name = "generic"
+
     def __init__(self, *args, **kw):
         super().__init__(
             "Add generic external IDP",
@@ -786,22 +830,59 @@ class AddGenericProviderStep(_BaseExternalProviderStep):
             *args,
             **kw,
         )
-        self._questions = copy.deepcopy(
-            _QUESTIONS[self._proto]["generic"])
 
     def _get_preseed_map(self):
-        preseed = super()._get_preseed_map()
-        preseed["issuer_url"] = None
-        return preseed
+        preseed = {
+            "openid": {
+                "client_id": None,
+                "client_secret": None,
+                "label": None,
+                "issuer_url": None,
+            },
+            "saml2": {
+                "label": None,
+                "metadata_url": None,
+                "ca_chain": None
+            },
+        }
+        return preseed[self._proto]
 
-    def _ask(self, q_bank: questions.QuestionBank, variables: dict):
+    def _ask_openid(self, q_bank: questions.QuestionBank, variables: dict):
         variables = super()._ask(q_bank, variables)
         issuer_url = q_bank.issuer_url.ask()
         if not issuer_url:
             raise click.ClickException("issuer_url is mandatory")
-        self._issuer_url = issuer_url
         variables["issuer_url"] = issuer_url
+        self._openid_config["issuer_url"] = issuer_url
         return variables
+
+    def _ask_saml2(self, q_bank: questions.QuestionBank, variables: dict):
+        self._saml2_config["label"] = q_bank.label.ask()
+        if not self._saml2_config["label"]:
+            label_name = self._provider_name.capitalize()
+            self._saml2_config["label"] = f"Log in with {label_name}"
+
+        metadata_url = q_bank.metadata_url.ask()
+        if not metadata_url:
+            raise click.ClickException("metadata-url is mandatory")
+
+        ca_chain = q_bank.ca_chain.ask()
+        if ca_chain:
+            self._saml2_config["ca-chain"] = ca_chain
+
+        self._saml2_config["metadata-url"] = metadata_url
+
+        variables["metadata_url"] = metadata_url
+        variables["ca_chain"] = ca_chain
+        variables["label"] = self._saml2_config["label"]
+
+        return variables
+
+    def _ask(self, q_bank: questions.QuestionBank, variables: dict):
+        ask_fn = getattr(self, f"_ask_{self._proto}", None)
+        if not ask_fn:
+            raise click.ClickException(f"unsupported protocol {self._proto}")
+        return ask_fn(q_bank, variables)
 
 
 class AddCanonicalProviderStep(_BaseProviderStep):
