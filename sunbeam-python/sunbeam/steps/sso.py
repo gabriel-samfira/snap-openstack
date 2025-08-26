@@ -1002,12 +1002,6 @@ class AddCanonicalProviderStep(_BaseProviderStep):
 
 
 class ValidateIdentityManifest(BaseStep):
-    _provider_question_map = {
-        "google": _BASE_QUESTIONS_OPENID,
-        "okta": _OKTA_QUESTIONS_OPENID,
-        "entra": _ENTRA_QUESTIONS_OPENID,
-        "generic": _GENERIC_PROVIDER_QUESTIONS_OPENID,
-    }
 
     def __init__(
         self,
@@ -1183,6 +1177,12 @@ class ValidateIdentityManifest(BaseStep):
 
         try:
             for name, config in profiles.items():
+                if config.protocol not in VALID_SSO_PROTOCOLS:
+                    raise ValueError(
+                        f"Invalid protocol {config.protocol} for profile "
+                        f"{name} (Valid protocols: "
+                        f"{', '.join(VALID_SSO_PROTOCOLS)})"
+                    )
                 cfg[config.protocol][name] = {
                     "provider_type": config.provider,
                 }
@@ -1355,9 +1355,9 @@ class SetKeystoneSAMLCertAndKeyStep(BaseStep, JujuStepHelper):
         deployment: Deployment,
         tfhelper: TerraformHelper,
         jhelper: JujuHelper,
-        manifest: Manifest,
-        x509_cert: str,
-        x509_key: str,
+        manifest: Manifest = None,
+        x509_cert: str = "",
+        x509_key: str = "",
     ):
         super().__init__(
             "Identity",
