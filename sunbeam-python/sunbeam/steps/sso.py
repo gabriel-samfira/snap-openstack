@@ -277,7 +277,7 @@ def _validate_saml2_config(name: str, idp: dict) -> None:
             f"could not find metadata-url for {name}",
         )
 
-    chain = config.get("ca-chain", None)
+    chain = config.get("ca-chain", "")
     with tempfile.NamedTemporaryFile() as fd:
         verify = True
         if chain:
@@ -869,7 +869,7 @@ class AddGenericProviderStep(_BaseExternalProviderStep):
             "saml2": {
                 "label": None,
                 "metadata_url": None,
-                "ca_chain": None
+                "ca_chain": ""
             },
         }
         return preseed[self._proto]
@@ -896,11 +896,13 @@ class AddGenericProviderStep(_BaseExternalProviderStep):
         ca_chain = q_bank.ca_chain.ask()
         if ca_chain:
             self._saml2_config["ca-chain"] = ca_chain
+        else:
+            self._saml2_config["ca-chain"] = ""
 
         self._saml2_config["metadata-url"] = metadata_url
 
         variables["metadata_url"] = metadata_url
-        variables["ca_chain"] = ca_chain
+        variables["ca_chain"] = self._saml2_config["ca-chain"]
         variables["label"] = self._saml2_config["label"]
 
         return variables
@@ -1059,12 +1061,17 @@ class ValidateIdentityManifest(BaseStep):
         if not metadata_url:
             raise ValueError(
                 f"Could not detemine metadata-url for provider {provider}")
-        return {
+
+        conf = {
             "metadata-url": metadata_url,
             "name": name,
             "label": config["label"],
-            "ca-chain": config.get("ca_chain", None),
         }
+        chain = config.get("ca_chain", "")
+        if chain:
+            conf["ca-chain"] = chain
+
+        return conf
 
     def _charm_config(
         self,
@@ -1122,6 +1129,7 @@ class ValidateIdentityManifest(BaseStep):
                 missing_keys.append(key)
 
             if key == "ca_chain" and not cfg_val:
+                norm_config["ca-chain"] = ""
                 continue
             norm_config[norm_key] = cfg_val
 
@@ -1281,9 +1289,11 @@ class DeployIdentityProvidersStep(BaseStep, JujuStepHelper):
                 if conf.get("provider_type", None) == "canonical":
                     canonical_providers[proto][provider] = conf
                     continue
+                if 'ca-chain' in conf["config"]:
+                    if not conf["config"]["ca-chain"]:
+                        conf["config"].pop("ca-chain", None)
                 tfvars["sso-providers"][proto][provider] = conf["config"]
                 apps.append(f"keystone-idp-{proto}-{provider}")
-
         self.tfhelper.write_tfvars(tfvars)
         update_config(self.client, CONFIG_KEY, tfvars)
 
@@ -1398,18 +1408,22 @@ class SetKeystoneSAMLCertAndKeyStep(BaseStep, JujuStepHelper):
         if not self.manifest:
             return {}
 
+        identity = self.manifest.core.config.identity
+        if not identity:
+            return {}
+
         has_manifest = all(
             [
-                self.manifest.saml2_x509.certificate,
-                self.manifest.saml2_x509.key,
+                identity.saml2_x509.certificate,
+                identity.saml2_x509.key,
             ],
         )
         if not has_manifest:
             return {}
 
         return {
-                "cert": self.manifest.saml2_x509.certificate,
-                "key": self.manifest.saml2_x509.key,
+                "cert": identity.saml2_x509.certificate,
+                "key": identity.saml2_x509.key,
             }
 
     def _get_cert_and_key_from_params(self) -> Mapping[str, str]:
