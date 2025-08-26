@@ -3,11 +3,13 @@
 
 import copy
 import logging
+import tempfile
 import queue
 from typing import (
     Any,
-    Literal,
+    Mapping,
 )
+import xml.etree.ElementTree as ET
 
 import click
 import requests
@@ -39,21 +41,26 @@ from sunbeam.core.terraform import (
     TerraformException,
     TerraformHelper,
 )
+from sunbeam.features.interface.utils import (
+    cert_and_key_match
+)
 from sunbeam.steps.openstack import CONFIG_KEY
 
 LOG = logging.getLogger(__name__)
 SSO_CONFIG_KEY = "SSOFeatureConfigKey"
 _CONFIG = "FeatureSSOExternalIDPConfig-%(proto)s-%(name)s"
+_SAML2_CERT_KEY_SECRET = "keystone-saml2-x509-key-cert"
+_SAML2_CONFIG_KEY = "KeystoneSAML2ConfigKey"
 
 _GOOGLE_ISSUER_URL = "https://accounts.google.com"
-_ENTRA_ISSUER_URL = "https://login.microsoftonline.com/%(tenant)s/v2.0"
+_ENTRA_ISSUER_URL = "https://login.microsoftonline.com/%(microsoft_tenant)s/v2.0"
 _OKTA_ISSUER_URL = "https://%(okta_org)s.okta.com"
 
 _GOOGLE_SAML2_METADATA_URL = (
     "https://accounts.google.com/o/saml2/idp?idpid=%(app_id)s"
 )
 _ENTRA_SAML_METADATA_URL = (
-    "https://login.microsoftonline.com/%(tenant)s/federationmetadata/2007-06"
+    "https://login.microsoftonline.com/%(microsoft_tenant)s/federationmetadata/2007-06"
     "/federationmetadata.xml?appid=%(app_id)s"
 )
 _OKTA_SAML2_METADATA_URL = (
@@ -180,7 +187,8 @@ VALID_SSO_PROTOCOLS = [
 console = Console()
 
 
-def _safe_get_sso_config(client: Client):
+def safe_get_sso_config(client: Client):
+    """Read SSO config with a fallback to empty protocol values."""
     try:
         cfg = read_config(client, SSO_CONFIG_KEY)
     except ConfigItemNotFoundException:
@@ -257,11 +265,41 @@ def _validate_oidc_config(name: str, idp: dict) -> None:
 
 
 def _validate_saml2_config(name: str, idp: dict) -> None:
-    # TODO: finish this
+    """Basic check for saml2 metadata URL."""
+    config = idp.get("config", {})
+    if not config:
+        raise ValueError(
+            f"invalid config for IDP {name}",
+        )
+    metadata_url = config.get("metadata-url", None)
+    if not metadata_url:
+        raise ValueError(
+            f"could not find metadata-url for {name}",
+        )
+
+    chain = config.get("ca-chain", None)
+    with tempfile.NamedTemporaryFile() as fd:
+        verify = True
+        if chain:
+            fd.write(chain)
+            fd.flush()
+            verify = fd.name
+        cfg_req = requests.get(metadata_url, verify=verify, timeout=10)
+        cfg_req.raise_for_status()
+
+    # return the response and remove any potential UTF-8 byte order mark.
+    data = cfg_req.text.lstrip('\ufeff')
+    root = ET.fromstring(data)
+    entity_id = root.attrib['entityID']
+    if not entity_id:
+        raise ValueError(
+            f"xml document does not contain an entityID for idp {name}",
+        )
     return None
 
 
 def _validate_idp(protocol: str, name: str, idp: dict) -> None:
+    """Basic check for idp configuration options."""
     validator_map = {
         "openid": _validate_oidc_config,
         "saml2": _validate_saml2_config,
@@ -298,7 +336,7 @@ class RemoveExternalProviderStep(BaseStep, JujuStepHelper):
     def run(self, status: Status | None = None) -> Result:
         """Apply terraform configuration to deploy openstack application."""
         tfvars = _safe_get_tfvars(self.client)
-        cfg = _safe_get_sso_config(self.client)
+        cfg = safe_get_sso_config(self.client)
 
         if self._provider_name in tfvars["sso-providers"][self._proto]:
             del tfvars["sso-providers"][self._proto][self._provider_name]
@@ -373,20 +411,14 @@ class UpdateExternalProviderStep(BaseStep, JujuStepHelper):
             "config"]["client_secret"] = self._secrets["client_secret"]
         update_config(self.client, SSO_CONFIG_KEY, cfg)
 
-        if tfvars.get("sso-providers"):
-            tfvars["sso-providers"][self._provider_name] = cfg[self._provider_name][
-                "config"
-            ]
-        else:
-            tfvars["sso-providers"] = {
-                self._provider_name: cfg[self._provider_name]["config"]
-            }
+        tfvars["sso-providers"][self._proto][self._provider_name] = cfg[
+            self._proto][self._provider_name]["config"]
 
         return (cfg, tfvars)
 
     def _update_saml2(self, cfg, tfvars):
         # No secrets to update for SAML2.
-        (cfg, tfvars)
+        return (cfg, tfvars)
 
     def _validate_secrets_openid(self, data: dict[str, str]):
         if not data:
@@ -427,9 +459,9 @@ class UpdateExternalProviderStep(BaseStep, JujuStepHelper):
     def run(self, status: Status | None = None) -> Result:
         """Apply terraform configuration to deploy openstack application."""
         tfvars = _safe_get_tfvars(self.client)
-        cfg = _safe_get_sso_config(self.client)
+        cfg = safe_get_sso_config(self.client)
 
-        if self._provider_name not in cfg[self._proto]:
+        if not cfg[self._proto].get(self._provider_name, None):
             return Result(
                 ResultType.FAILED,
                 f"Provider {self._provider_name} ({self._proto}) not found")
@@ -655,7 +687,7 @@ class _BaseExternalProviderStep(_BaseProviderStep):
         variables["client_id"] = self._openid_config["client_id"]
         variables["client_secret"] = self._openid_config["client_secret"]
         return variables
-    
+
     def _ask_saml2(self, q_bank: questions.QuestionBank, variables: dict):
         self._saml2_config["label"] = q_bank.label.ask()
         if not self._saml2_config["label"]:
@@ -692,7 +724,7 @@ class _BaseExternalProviderStep(_BaseProviderStep):
 
     def run(self, status: Status | None = None) -> Result:
         tfvars = _safe_get_tfvars(self.client)
-        cfg = _safe_get_sso_config(self.client)
+        cfg = safe_get_sso_config(self.client)
 
         idp = cfg[self._proto].get(self._provider_name, None)
         if idp:
@@ -703,7 +735,6 @@ class _BaseExternalProviderStep(_BaseProviderStep):
                 "config": self._charm_config,
                 "provider_type": self._provider_type,
             }
-        update_config(self.client, SSO_CONFIG_KEY, cfg)
 
         try:
             _validate_idp(
@@ -721,12 +752,13 @@ class _BaseExternalProviderStep(_BaseProviderStep):
                 tfvars["sso-providers"][proto][provider] = data["config"]
 
         self.tfhelper.write_tfvars(tfvars)
-        update_config(self.client, CONFIG_KEY, tfvars)
-
         try:
             self.tfhelper.apply()
         except TerraformException as e:
             return Result(ResultType.FAILED, f"Failed to apply terraform plan {e}")
+
+        update_config(self.client, SSO_CONFIG_KEY, cfg)
+        update_config(self.client, CONFIG_KEY, tfvars)
 
         charm_name = f"keystone-idp-{self._proto}-{self._provider_name}"
         apps = ["keystone", "horizon", charm_name]
@@ -809,7 +841,7 @@ class AddEntraProviderStep(_BaseExternalProviderStep):
         tenant_id = q_bank.microsoft_tenant.ask()
         if not tenant_id:
             raise click.ClickException("microsoft_tenant is mandatory")
-        self._url_params["tenant"] = tenant_id
+        self._url_params["microsoft_tenant"] = tenant_id
         variables["microsoft_tenant"] = tenant_id
         return variables
 
@@ -921,7 +953,7 @@ class AddCanonicalProviderStep(_BaseProviderStep):
 
     def run(self, status: Status | None = None) -> Result:
         """Run configure steps."""
-        cfg = _safe_get_sso_config(self.client)
+        cfg = safe_get_sso_config(self.client)
 
         idp = cfg.get(self._provider_name)
         if idp:
@@ -988,24 +1020,20 @@ class ValidateIdentityManifest(BaseStep):
         self.variables: dict = {}
 
     def _issuer_url(self, provider: str, config: dict[str, str | None]):
-        if provider == "google":
-            return _GOOGLE_ISSUER_URL
-        if provider == "okta":
-            return _OKTA_ISSUER_URL % config["okta_org"]
-        if provider == "entra":
-            return _ENTRA_ISSUER_URL % config["microsoft_tenant"]
         if provider == "generic":
             return config["issuer_url"]
-        raise click.ClickException(
-            f"Cannot determine issuer_url for provider type {provider}"
-        )
+        else:
+            issuer_url_tpl = _METADATA_URL_MAP["openid"].get(provider, None)
+            if issuer_url_tpl is None:
+                raise ValueError(f"Invalid provider type {provider}")
+            issuer_url = issuer_url_tpl % config
+            return issuer_url
 
-    def _charm_config(
+    def _charm_config_openid(
         self,
         name: str,
         provider: str,
-        protocol: str,
-        config: dict[str, str | None],
+        config: dict[str, str | None]
     ):
         if not config.get("label"):
             config["label"] = f"Log in with {name}"
@@ -1017,6 +1045,47 @@ class ValidateIdentityManifest(BaseStep):
             "label": config["label"],
             "issuer_url": self._issuer_url(provider, config),
         }
+
+    def _charm_config_saml2(
+        self,
+        name: str,
+        provider: str,
+        config: dict[str, str | None]
+    ):
+        if not config.get("label"):
+            config["label"] = f"Log in with {name}"
+        metadata_url = None
+        if provider == "generic":
+            metadata_url = config.get("metadata-url", None)
+        else:
+            metadata_url_tpl = _METADATA_URL_MAP["saml2"].get(provider, None)
+            if metadata_url_tpl is None:
+                raise ValueError(f"Invalid provider type {provider}")
+            metadata_url = metadata_url_tpl % config
+        if not metadata_url:
+            raise ValueError(
+                f"Could not detemine metadata-url for provider {provider}")
+        return {
+            "metadata-url": metadata_url,
+            "name": name,
+            "label": config["label"],
+            "ca-chain": config.get("ca_chain", None),
+        }
+
+    def _charm_config(
+        self,
+        name: str,
+        provider: str,
+        protocol: str,
+        config: dict[str, str | None],
+    ):
+        cfg_map = {
+            "openid": self._charm_config_openid,
+            "saml2": self._charm_config_saml2,
+        }
+        if protocol not in cfg_map:
+            raise ValueError(f"Invalid protocol {protocol}")
+        return cfg_map[protocol](name, provider, config)
 
     def _canonical_charm_config(
         self, name: str, provider: str, protocol: str, config: dict[str, str]
@@ -1039,9 +1108,10 @@ class ValidateIdentityManifest(BaseStep):
     def _external_charm_config(
         self, name: str, provider: str, protocol: str, config: dict[str, str]
     ) -> dict[str, Any]:
-        questions = self._provider_question_map.get(provider, None)
+        questions = _QUESTIONS.get(protocol, {}).get(provider, None)
         if not questions:
-            raise click.ClickException(f"Unknown provider type {provider} for {name}")
+            raise click.ClickException(
+                f"Unknown provider type {provider} ({protocol}) for {name}")
 
         missing_keys = []
         norm_config = {}
@@ -1054,8 +1124,11 @@ class ValidateIdentityManifest(BaseStep):
                     None,
                 ),
             )
-            if not cfg_val:
+            if not cfg_val and key != "ca_chain":
                 missing_keys.append(key)
+
+            if key == "ca_chain" and not cfg_val:
+                continue
             norm_config[norm_key] = cfg_val
 
         if missing_keys:
@@ -1096,7 +1169,7 @@ class ValidateIdentityManifest(BaseStep):
         Invoked when the step is run and returns a ResultType to indicate
         :return:
         """
-        cfg = _safe_get_sso_config(self.client)
+        cfg = safe_get_sso_config(self.client)
 
         if not self.manifest:
             return Result(ResultType.COMPLETED)
@@ -1114,6 +1187,8 @@ class ValidateIdentityManifest(BaseStep):
                     "provider_type": config.provider,
                 }
                 if config.provider == "canonical":
+                    if config.protocol != "openid":
+                        continue
                     cfg[config.protocol][name][
                         "config"] = self._canonical_charm_config(
                         name,
@@ -1192,7 +1267,7 @@ class DeployIdentityProvidersStep(BaseStep, JujuStepHelper):
         :return:
         """
         tfvars = _safe_get_tfvars(self.client)
-        cfg = _safe_get_sso_config(self.client)
+        cfg = safe_get_sso_config(self.client)
 
         apps = ["keystone", "horizon"]
         canonical_providers = {
@@ -1268,5 +1343,171 @@ class DeployIdentityProvidersStep(BaseStep, JujuStepHelper):
                     )
                 except Exception as e:
                     return Result(ResultType.FAILED, str(e))
+
+        return Result(ResultType.COMPLETED)
+
+
+class SetKeystoneSAMLCertAndKeyStep(BaseStep, JujuStepHelper):
+    """Deploy identity providers on bootstrap."""
+
+    def __init__(
+        self,
+        deployment: Deployment,
+        tfhelper: TerraformHelper,
+        jhelper: JujuHelper,
+        manifest: Manifest,
+        x509_cert: str,
+        x509_key: str,
+    ):
+        super().__init__(
+            "Identity",
+            "Setting Keystone SP SAML2 certificate and key",
+        )
+        self.client = deployment.get_client()
+        self.manifest = manifest
+        self.tfhelper = tfhelper
+        self.jhelper = jhelper
+        self.x509_cert = x509_cert
+        self.x509_key = x509_key
+
+    def is_skip(self, status: Status | None = None) -> Result:
+        """Determines if the step should be skipped or not.
+
+        :return: ResultType.SKIPPED if the Step should be skipped,
+                ResultType.COMPLETED or ResultType.FAILED otherwise
+        """
+        if not self.manifest and not all([self.x509_cert, self.x509_key]):
+            return Result(ResultType.SKIPPED)
+
+        if all([self.x509_cert, self.x509_key]):
+            return Result(ResultType.COMPLETED)
+
+        if not self._cert_and_key_from_manifest():
+            return Result(ResultType.SKIPPED)
+        return Result(ResultType.COMPLETED)
+
+    def has_prompts(self) -> bool:
+        """Returns true if the step has prompts that it can ask the user.
+
+        :return: True if the step can ask the user for prompts,
+                 False otherwise
+        """
+        return False
+
+    def _cert_and_key_from_manifest(self) -> Mapping[str, str]:
+        if not self.manifest:
+            return {}
+
+        has_manifest = all(
+            [
+                self.manifest.saml2_x509.certificate,
+                self.manifest.saml2_x509.key,
+            ],
+        )
+        if not has_manifest:
+            return {}
+
+        return {
+                "cert": self.manifest.saml2_x509.certificate,
+                "key": self.manifest.saml2_x509.key,
+            }
+
+    def _get_cert_and_key_from_params(self) -> Mapping[str, str]:
+        if all([self.x509_cert, self.x509_key]):
+            return {
+                "cert": self.x509_cert,
+                "key": self.x509_key,
+            }
+        cert_details = self._cert_and_key_from_manifest()
+        return cert_details
+
+    def run(self, status: Status | None) -> Result:
+        """Run the step to completion.
+
+        Invoked when the step is run and returns a ResultType to indicate
+        :return:
+        """
+
+        cert_and_key = self._get_cert_and_key_from_params()
+        try:
+            cert_data = open(cert_and_key["cert"]).read()
+            key_data = open(cert_and_key["key"]).read()
+        except Exception as e:
+            return Result(ResultType.FAILED, str(e))
+
+        if not cert_and_key_match(cert_data.encode(), key_data.encode()):
+            raise ValueError(
+                f"Certificate {cert_and_key["cert"]} is not derived from {cert_and_key["key"]}"
+            )
+
+        try:
+            saml2_config = read_config(self.client, _SAML2_CONFIG_KEY)
+        except ConfigItemNotFoundException:
+            saml2_config = {}
+
+        saml_secret_id = saml2_config.get("saml2_cert_key_secret", None)
+
+        if saml_secret_id:
+            k_secret = self.jhelper.get_secret(
+                OPENSTACK_MODEL,
+                saml_secret_id,
+            )
+        else:
+            saml_secret_id = self.jhelper.add_secret(
+                info="Keystone SAML SP x509 key",
+                model=OPENSTACK_MODEL,
+                name=_SAML2_CERT_KEY_SECRET,
+                data={
+                    "certificate": cert_data,
+                    "key": key_data,
+                }
+            )
+            saml2_config["saml2_cert_key_secret"] = saml_secret_id
+            update_config(self.client, _SAML2_CONFIG_KEY, saml2_config)
+
+            k_secret = self.jhelper.get_secret(
+                OPENSTACK_MODEL,
+                saml_secret_id,
+            )
+
+        k_cert = k_secret.get("certificate", None)
+        k_key = k_secret.get("key", None)
+        if cert_data != k_cert or key_data != k_key:
+            self.jhelper.update_secret(
+                model=OPENSTACK_MODEL,
+                name=saml_secret_id,
+                data={
+                    "certificate": cert_data,
+                    "key": key_data,
+                }
+            )
+
+        # Grant secret access to the vault application
+        self.jhelper.grant_secret(
+            OPENSTACK_MODEL, saml_secret_id, "keystone"
+        )
+
+        try:
+            tfvars = read_config(self.client, CONFIG_KEY)
+        except ConfigItemNotFoundException:
+            tfvars = {}
+
+        tfvars["saml-x509-keypair"] = f"secret:{saml_secret_id}"
+
+        update_config(self.client, CONFIG_KEY, tfvars)
+        self.tfhelper.write_tfvars(tfvars)
+        try:
+            self.tfhelper.apply()
+        except TerraformException as e:
+            return Result(ResultType.FAILED, str(e))
+
+        try:
+            self.jhelper.wait_until_active(
+                OPENSTACK_MODEL,
+                ["keystone"],
+                timeout=APPLICATION_REMOVE_TIMEOUT,
+            )
+        except (JujuWaitException, TimeoutError) as e:
+            return Result(ResultType.FAILED, str(e))
 
         return Result(ResultType.COMPLETED)

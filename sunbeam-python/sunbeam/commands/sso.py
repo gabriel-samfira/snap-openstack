@@ -3,7 +3,6 @@
 
 import click
 import yaml
-import os
 from rich.console import Console
 from rich.table import Table
 
@@ -21,17 +20,12 @@ from sunbeam.core.deployment import Deployment
 from sunbeam.core.juju import (
     ActionFailedException,
     JujuHelper,
-    JujuSecretNotFound,
     LeaderNotFoundException,
-    JujuWaitException,
 )
 from sunbeam.core.openstack import OPENSTACK_MODEL
-from sunbeam.core.terraform import TerraformInitStep, TerraformException
+from sunbeam.core.terraform import TerraformInitStep
 from sunbeam.core.checks import VerifyBootstrappedCheck, run_preflight_checks
 from sunbeam.steps.juju import RemoveSaasApplicationsStep
-from sunbeam.features.interface.utils import (
-    cert_and_key_match
-)
 from sunbeam.steps.sso import (
     APPLICATION_REMOVE_TIMEOUT,
     SSO_CONFIG_KEY,
@@ -43,14 +37,12 @@ from sunbeam.steps.sso import (
     AddOktaProviderStep,
     RemoveExternalProviderStep,
     UpdateExternalProviderStep,
+    SetKeystoneSAMLCertAndKeyStep,
+    safe_get_sso_config,
 )
-from sunbeam.features.identity.steps import SetKeystoneSAMLCertAndKeyStep
 from sunbeam.utils import click_option_show_hints
-from sunbeam.steps.openstack import CONFIG_KEY
-
 
 console = Console()
-_SAML2_CERT_KEY_SECRET = "keystone-saml2-x509-key-cert"
 
 
 @click.command(name="list")
@@ -71,11 +63,7 @@ def list_sso(
     deployment: Deployment = ctx.obj
     client = deployment.get_client()
 
-    try:
-        cfg = read_config(client, SSO_CONFIG_KEY)
-    except ConfigItemNotFoundException:
-        cfg = {}
-
+    cfg = safe_get_sso_config(client)
     results = {}
 
     for proto, providers in cfg.items():
@@ -149,13 +137,9 @@ def add_sso(
     ]
     run_preflight_checks(preflight_checks, console)
 
-    try:
-        cfg = read_config(client, SSO_CONFIG_KEY)
-    except ConfigItemNotFoundException:
-        cfg = {}
-
-    if name in cfg:
-        click.echo(f"{name} is already enabled.")
+    cfg = safe_get_sso_config(client)
+    if cfg.get(provider_protocol, {}).get(name, {}):
+        click.echo(f"{name} ({provider_protocol}) is already enabled.")
         return
 
     jhelper = JujuHelper(deployment.juju_controller)
@@ -225,10 +209,7 @@ def remove_sso(
         VerifyBootstrappedCheck(client)
     ]
     run_preflight_checks(preflight_checks, console)
-    try:
-        cfg = read_config(client, SSO_CONFIG_KEY)
-    except ConfigItemNotFoundException:
-        cfg = {}
+    cfg = safe_get_sso_config(client)
 
     provider = cfg.get(protocol, {}).get(name)
     if not provider:
@@ -295,7 +276,7 @@ def update_sso(
     secrets_file: str,
     show_hints: bool
 ):
-    """Update identity provider."""
+    """Update identity provider (openid only)."""
     deployment: Deployment = ctx.obj
     client = deployment.get_client()
     preflight_checks = [
@@ -384,12 +365,9 @@ def purge_sso(
         VerifyBootstrappedCheck(client)
     ]
     run_preflight_checks(preflight_checks, console)
-    try:
-        config = read_config(client, SSO_CONFIG_KEY)
-    except ConfigItemNotFoundException:
-        config = {}
 
-    if not yes_i_mean_it and config:
+    config = safe_get_sso_config(client)
+    if not yes_i_mean_it and any(config.values()):
         msg = (
             "You have one or more identity providers enabled. "
             "This action will remove all of them. Are you sure?"
@@ -401,18 +379,20 @@ def purge_sso(
         TerraformInitStep(tfhelper),
     ]
     saas_to_remove = []
-    for provider, cfg in config.items():
-        if cfg.get("provider_type", None) == "canonical":
-            saas_to_remove.append(provider)
-            saas_to_remove.append(f"{provider}-cert")
-        else:
-            remove_idp_plan.append(
-                RemoveExternalProviderStep(
-                    deployment=deployment,
-                    jhelper=jhelper,
-                    provider_name=provider,
+    for proto, section in config.items():
+        for provider, cfg in section.items():
+            if cfg.get("provider_type", None) == "canonical":
+                saas_to_remove.append(provider)
+                saas_to_remove.append(f"{provider}-cert")
+            else:
+                remove_idp_plan.append(
+                    RemoveExternalProviderStep(
+                        deployment=deployment,
+                        jhelper=jhelper,
+                        provider_name=provider,
+                        provider_proto=proto,
+                    )
                 )
-            )
 
     if saas_to_remove:
         remove_idp_plan.append(
